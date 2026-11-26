@@ -1,0 +1,1973 @@
+---
+# Playbook : internet-maintenance.yml
+# Purpose  : End-to-end internet maintenance workflow for IBM, Broadcom, and BMC.
+#            Covers RECEIVE ORDER (vendor-specific GIMZIP template) →
+#            APPLY CHECK (technician review gate) → APPLY.
+#
+# Usage (interactive — vars_prompt will fire):
+#   ansible-playbook playbooks/internet-maintenance.yml
+#
+# Usage (non-interactive — pass all vars via -e):
+#   ansible-playbook playbooks/internet-maintenance.yml \
+#     -e "vendor=ibm" \
+#     -e "smpe_csi_dsn=ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI" \
+#     -e "smpe_target_zone_input=TZONE" \
+#     -e "smpe_dlib_zone_input=DZONE"
+#
+# Usage (resume after RECEIVE failure — skip RECEIVE, load SYSMODs from explicit job or audit log):
+#   ansible-playbook playbooks/internet-maintenance.yml \
+#     -e "vendor=ibm" \
+#     -e "smpe_csi_dsn=ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI" \
+#     -e "smpe_target_zone_input=TZONE" \
+#     -e "smpe_dlib_zone_input=DZONE" \
+#     -e "smpe_receive_job_id=JOBxxxxx"   # preferred: reuse specific completed job
+#
+# Usage (resume using audit log — no job ID available):
+#   ansible-playbook playbooks/internet-maintenance.yml \
+#     -e "vendor=ibm" \
+#     -e "smpe_csi_dsn=ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI" \
+#     -e "smpe_target_zone_input=TZONE" \
+#     -e "smpe_dlib_zone_input=DZONE" \
+#     -e "skip_receive=true"
+#
+# Usage (skip to ACCEPT — APPLY already ran, jump directly to Phase 5 ACCEPT):
+#   ansible-playbook playbooks/internet-maintenance.yml \
+#     -e "vendor=ibm" \
+#     -e "smpe_csi_dsn=ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI" \
+#     -e "smpe_target_zone_input=TZONE" \
+#     -e "smpe_dlib_zone_input=DZONE" \
+#     -e "smpe_receive_job_id=JOBxxxxx" \
+#     -e "smpe_apply_job_id=JOByyyyy"
+#
+# SMPNTS staging directories (fixed per vendor, cleaned by DELETEPKG after each RECEIVE):
+#   ibm       → /maint_zfs/
+#   broadcom  → /maint_zfs/
+#   bmc       → /maint_zfs/
+
+- name: Internet Maintenance — RECEIVE ORDER → APPLY CHECK → APPLY
+  hosts: dcuf
+  gather_facts: false
+
+  vars_prompt:
+    - name: vendor
+      prompt: |
+
+        ══════════════════════════════════════════════════════
+         SMP/E Internet Maintenance — Vendor Selection
+        ══════════════════════════════════════════════════════
+         Select vendor:
+           ibm       — IBM Electronic Software Delivery
+           broadcom  — Broadcom Software
+           bmc       — BMC Software
+        ──────────────────────────────────────────────────────
+         Enter vendor [ibm/broadcom/bmc]
+      private: false
+
+    - name: smpe_csi_dsn
+      prompt: "Enter Global CSI dataset name (e.g. ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI)"
+      private: false
+
+    - name: smpe_target_zone_input
+      prompt: "Enter TARGET zone name (e.g. TZONE)"
+      private: false
+
+    - name: smpe_dlib_zone_input
+      prompt: "Enter DISTRIBUTION zone name (e.g. DZONE)"
+      private: false
+
+
+  vars:
+    # ── Vendor → JCL template mapping ──────────────────────────────────────
+    _vendor_template_map:
+      ibm:      "templates/smpe_receive_ibm.j2"
+      broadcom: "templates/smpe_receive_broadcom.j2"
+      bmc:      "templates/smpe_receive_bmc.j2"
+
+    # ── Vendor → default SMPNTS USS staging directory ──────────────────────
+    # SMPNTS is a DIRECTORY (staging area) — SMP/E stages downloaded packages here.
+    # The directory must exist on USS before the job runs (PATHDISP=KEEP).
+    _vendor_nts_map:
+      ibm:      "/maint_zfs"
+      broadcom: "/maint_zfs"
+      bmc:      "/maint_zfs"
+
+    # Resolved at runtime in set_fact tasks below
+    _vendor_key:    "{{ vendor | lower | trim }}"
+    _vendor_jobpfx: "{{ {'ibm': 'IBM', 'broadcom': 'BCM', 'bmc': 'BMC'}[vendor | lower | trim] | default('UNK') }}"
+    # CSI-keyed cycle identifier — used in marker filenames to scope guards per product
+    _csi_key:       "{{ smpe_csi_dsn | lower | replace('.', '_') }}"
+
+    # Set skip_receive=true to bypass RECEIVE and load SYSMODs from the previous audit log
+    skip_receive: false
+
+    # Test mode — skips cycle markers and phase reports so the same CSI can be re-run
+    # freely without manual marker cleanup.  Audit log JSON files are still written
+    # (needed by the inline Python report generators) but no .md reports are saved.
+    # Usage: -e "smpe_test_mode=true"
+    smpe_test_mode: false
+
+  pre_tasks:
+    # ── Shell wrapper (same as other playbooks) ─────────────────────────────
+    - name: Ensure /tmp/zos_shell.sh wrapper is present
+      vars:
+        ansible_shell_executable: /bin/sh
+      raw: |
+        set -e
+        rm -f /tmp/zos_shell.sh
+        echo '#!/bin/sh'                                                                     > /tmp/zos_shell.sh
+        echo 'export _BPXK_AUTOCVT=ON'                                                     >> /tmp/zos_shell.sh
+        echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3'                                     >> /tmp/zos_shell.sh
+        echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+        echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+        echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13'                           >> /tmp/zos_shell.sh
+        echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"'                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_ERR=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_IN=txt'                                                    >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_OUT=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export LANG=C'                                                                >> /tmp/zos_shell.sh
+        echo 'for f in "${HOME}/.ansible/tmp/"*/AnsiballZ_*; do'                           >> /tmp/zos_shell.sh
+        echo '  [ -f "$f" ] && chtag -tc ISO8859-1 "$f" 2>/dev/null || true'              >> /tmp/zos_shell.sh
+        echo 'done'                                                                         >> /tmp/zos_shell.sh
+        echo 'exec /bin/sh "$@"'                                                           >> /tmp/zos_shell.sh
+        chmod +x /tmp/zos_shell.sh
+      changed_when: false
+
+    - name: Ensure logs directory exists on control node
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../logs"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+  tasks:
+
+    # ── 1. Validate inputs ──────────────────────────────────────────────────
+    - name: Validate vendor selection
+      assert:
+        that:
+          - _vendor_key in ['ibm', 'broadcom', 'bmc']
+          - smpe_csi_dsn is defined and smpe_csi_dsn | length > 0
+          - smpe_target_zone_input is defined and smpe_target_zone_input | length > 0
+          - smpe_dlib_zone_input is defined and smpe_dlib_zone_input | length > 0
+        fail_msg: >-
+          Invalid input. vendor must be one of: ibm, broadcom, bmc.
+          smpe_csi_dsn, smpe_target_zone_input and smpe_dlib_zone_input are required.
+
+    # ── 2. Resolve runtime variables ────────────────────────────────────────
+    - name: Resolve vendor-specific variables
+      set_fact:
+        receive_template:         "{{ _vendor_template_map[_vendor_key] }}"
+        smpe_nts_path:            "{{ _vendor_nts_map[_vendor_key] }}"
+        smpe_target_zone:         "{{ smpe_target_zone_input }}"
+        smpe_dlib_zone:           "{{ smpe_dlib_zone_input }}"
+        received_sysmod_list:     []
+        applycheck_approved_list: []
+        not_applied_sysmods:      []
+        applied_sysmod_list:      []
+        accepted_sysmod_list:     []
+
+    # ── 3. Display run summary ───────────────────────────────────────────────
+    - name: Display maintenance run parameters
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           Internet Maintenance Run — {{ _vendor_key | upper }}
+          ══════════════════════════════════════════════════════
+           Vendor       : {{ _vendor_key | upper }}
+           JCL Template : {{ receive_template }}
+           SMPCSI       : {{ smpe_csi_dsn }}
+           SMPNTS       : {{ smpe_nts_path }}
+           Global zone  : {{ smpe_global_zone }}
+           Target zone  : {{ smpe_target_zone }}
+           Dlib zone    : {{ smpe_dlib_zone }}
+          ══════════════════════════════════════════════════════
+
+    # ── Test mode: auto-clear cycle markers so the same CSI can re-run without manual cleanup ─
+    - name: "[PRE-FLIGHT] Test mode — auto-clear cycle markers"
+      shell: >
+        rm -f "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_*.marker"
+        && echo "cleared"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      when: smpe_test_mode | default(false) | bool
+      changed_when: true
+
+    # ── PHASE 1 pre-check: Skip if this cycle is already complete ────────────
+    # Marker is keyed by vendor + CSI (not date) — scopes to one product/cycle.
+    # Reset for a new refresh cycle: rm logs/cycle_{{ vendor }}_{{ csi_key }}_*.marker
+    - name: "[PHASE 1] Check for cycle-complete (ACCEPT or NO_NEW_SYSMODS) marker"
+      shell: >-
+        { test -f "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_accept.marker" || test -f "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_complete.marker"; } && echo FOUND || echo NOT_FOUND
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _complete_marker
+      changed_when: false
+
+    - name: "[PHASE 1] Cycle already complete — nothing to do"
+      debug:
+        msg: >
+          A cycle-complete marker (accept or complete) was found for
+          CSI {{ smpe_csi_dsn }}. Maintenance cycle is already done (ACCEPT completed or
+          RECEIVE returned 0 SYSMODs — CSI is already at current level).
+          To start a new refresh cycle, delete:
+            rm logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_*.marker
+      when: _complete_marker.stdout | default('') == 'FOUND'
+
+    - name: "[PHASE 1] End play — cycle already complete"
+      meta: end_play
+      when: _complete_marker.stdout | default('') == 'FOUND'
+
+    # ── PHASE 1 pre-check: Skip RECEIVE only when explicitly requested ──────────────
+    # Option A — Explicit job ID: pass -e "smpe_receive_job_id=JOBxxxxx"
+    #   Skips RECEIVE and loads SYSMODs from that job's z/OS spool output.
+    #   Use when RECEIVE already ran successfully and you are resuming a failed workflow.
+    # Option B — Explicit skip + audit log: pass -e "skip_receive=true" (no job ID).
+    #   Loads SYSMODs from the most recent local audit log in logs/.
+    #   Use only when resuming after a partial failure.
+    #
+    # Default (no flags): always submits a fresh RECEIVE ORDER job.
+
+    # Path A: explicit job ID provided by operator (resume / retry scenario)
+    - name: "[PHASE 1] Use explicit RECEIVE ORDER job ID (smpe_receive_job_id)"
+      set_fact:
+        _auto_receive_job_id: "{{ smpe_receive_job_id }}"
+        skip_receive: true
+      when:
+        - smpe_receive_job_id | default('') | length > 0
+        - not (skip_receive | default(false) | bool)
+
+    - name: "[PHASE 1] Explicit job ID provided — RECEIVE will be skipped"
+      debug:
+        msg: >-
+          smpe_receive_job_id={{ smpe_receive_job_id }} provided.
+          Skipping RECEIVE ORDER — will load SYSMODs from existing job output.
+      when: smpe_receive_job_id | default('') | length > 0
+
+    # ── PHASE 1 pre-check: Skip RECEIVE if already done this cycle ────────────
+    # RECEIVE marker is written after RECEIVE completes. It is CSI-keyed so different
+    # products on the same day do not block each other.
+    - name: "[PHASE 1] Check for cycle RECEIVE marker"
+      shell: >
+        test -f "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_receive.marker"
+        && echo FOUND || echo NOT_FOUND
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _receive_marker
+      changed_when: false
+
+    - name: "[PHASE 1] RECEIVE already done this cycle — skipping RECEIVE ORDER"
+      debug:
+        msg: >
+          Marker logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_receive.marker found.
+          RECEIVE ORDER already completed for CSI {{ smpe_csi_dsn }} this cycle.
+          Skipping RECEIVE — proceeding directly to APPLY CHECK.
+      when:
+        - _receive_marker.stdout | default('') == 'FOUND'
+        - smpe_receive_job_id | default('') | length == 0
+        - not (skip_receive | default(false) | bool)
+
+    - name: "[PHASE 1] Set skip_receive from cycle marker"
+      set_fact:
+        skip_receive: true
+      when:
+        - _receive_marker.stdout | default('') == 'FOUND'
+        - smpe_receive_job_id | default('') | length == 0
+        - not (skip_receive | default(false) | bool)
+
+    # ── PHASE 1: RECEIVE ORDER ───────────────────────────────────────────────
+    - name: "[PHASE 1] RECEIVE ORDER"
+      when: not (skip_receive | default(false) | bool)
+      block:
+
+        - name: "[PHASE 1] Render RECEIVE ORDER JCL from template"
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../{{ receive_template }}"
+            dest: "/tmp/imr_receive_{{ inventory_hostname }}.jcl"
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_shell_executable: /bin/bash
+
+        - name: "[PHASE 1] Copy RECEIVE ORDER JCL to z/OS USS"
+          ibm.ibm_zos_core.zos_copy:
+            src: "/tmp/imr_receive_{{ inventory_hostname }}.jcl"
+            dest: "/tmp/imr_receive_{{ inventory_hostname }}.jcl"
+            replace: true
+            binary: false
+            encoding:
+              from: UTF-8
+              to: IBM-1047
+          environment: "{{ environment_vars }}"
+
+        - name: "[PHASE 1] Submit {{ _vendor_key | upper }} RECEIVE ORDER job"
+          ibm.ibm_zos_core.zos_job_submit:
+            src: "/tmp/imr_receive_{{ inventory_hostname }}.jcl"
+            location: uss
+            wait_time: 14400  # 4 hours — covers the full IBM Shopz package download
+          environment: "{{ environment_vars }}"
+          register: _receive_submit
+          failed_when: false
+
+        - name: "[PHASE 1] Fail if RECEIVE ORDER could not be submitted"
+          fail:
+            msg: >-
+              RECEIVE ORDER submission failed — no job_id returned.
+              Check JCL syntax and USS path.
+              Error: {{ _receive_submit.msg | default('unknown') }}
+          when: >-
+            _receive_submit.jobs is not defined
+            or _receive_submit.jobs | length == 0
+            or _receive_submit.jobs[0].job_id is not defined
+
+        - name: "[PHASE 1] RECEIVE ORDER submitted — waiting for completion"
+          debug:
+            msg: >
+              ══ RECEIVE ORDER complete ══
+              Job {{ _receive_submit.jobs[0].job_name }} ({{ _receive_submit.jobs[0].job_id }})
+              finished during submit wait (wait_time=14400s).
+              Verifying RC via poll...
+
+        - name: "[PHASE 1] Poll RECEIVE ORDER job until complete"
+          ibm.ibm_zos_core.zos_job_query:
+            job_id: "{{ _receive_submit.jobs[0].job_id }}"
+          environment: "{{ environment_vars }}"
+          register: _receive_poll
+          failed_when: false
+          until: >
+            _receive_poll.jobs is defined
+            and _receive_poll.jobs | length > 0
+            and ((_receive_poll.jobs[0].ret_code.code | default(none) is not none
+                  and _receive_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+                 or _receive_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+          retries: 1440  # 4 hours at 10s intervals
+          delay: 10
+
+        # Hard re-verify — call zos_job_query once more to confirm the job is
+        # truly not active before proceeding to APPLY CHECK. Guards against
+        # false-positive poll exits where ret_code.code is non-None on an AC job.
+        - name: "[PHASE 1] Re-verify RECEIVE job is not active before proceeding"
+          ibm.ibm_zos_core.zos_job_query:
+            job_id: "{{ _receive_submit.jobs[0].job_id }}"
+          environment: "{{ environment_vars }}"
+          register: _receive_reverify
+
+        - name: "[PHASE 1] Fail if RECEIVE job still active after poll"
+          fail:
+            msg: >-
+              RECEIVE ORDER job {{ _receive_submit.jobs[0].job_id }} is still
+              active (status={{ _receive_reverify.jobs[0].status | default('unknown') }}).
+              APPLY CHECK will not start until RECEIVE completes.
+              This is a poll false-positive — re-run or increase poll delay.
+          when: >-
+            _receive_reverify.jobs is defined
+            and _receive_reverify.jobs | length > 0
+            and _receive_reverify.jobs[0].status | default('') | upper in ['AC', 'ACTIVE', 'INPUT', 'HELD']
+
+        # Capture RC from poll result. In ibm.ibm_zos_core 1.x, ret_code.code can
+        # be None even for completed jobs; fall back to parsing ret_code.msg (e.g.
+        # "CC 0000" → 0, "ABEND S0C7" → treated as 12).
+        - name: "[PHASE 1] Capture RECEIVE RC from poll result"
+          set_fact:
+            receive_rc: >-
+              {{ _receive_poll.jobs[0].ret_code.code | int
+                 if (_receive_poll.jobs[0].ret_code is defined
+                     and _receive_poll.jobs[0].ret_code.code is not none
+                     and _receive_poll.jobs[0].ret_code.code | string != 'None')
+                 else ((_receive_poll.jobs[0].ret_code.msg | default('CC 0000'))
+                       | regex_replace('^CC\s+0*(\d+).*', '\1') | default('0')) | int }}
+
+        - name: "[PHASE 1] Fetch RECEIVE ORDER full output"
+          ibm.ibm_zos_core.zos_job_output:
+            job_id: "{{ _receive_submit.jobs[0].job_id }}"
+          environment: "{{ environment_vars }}"
+          register: receive_job
+
+        - name: "[PHASE 1] Guard — fail if RECEIVE job still active after output fetch"
+          fail:
+            msg: >-
+              RECEIVE job {{ receive_job.jobs[0].job_id }} reports status
+              '{{ receive_job.jobs[0].status | default('unknown') }}' — job is still
+              running. APPLY CHECK will not proceed until RECEIVE is complete.
+          when: receive_job.jobs[0].status | default('') | upper in ['AC', 'ACTIVE']
+
+        - name: "[PHASE 1] RECEIVE ORDER result"
+          debug:
+            msg: >-
+              Job {{ receive_job.jobs[0].job_name }}
+              ({{ receive_job.jobs[0].job_id }})
+              RC={{ receive_rc }}
+
+        - name: "[PHASE 1] Fail if RECEIVE RC > 4"
+          fail:
+            msg: >-
+              RECEIVE ORDER FAILED —
+              {{ receive_job.jobs[0].job_name }}
+              RC={{ receive_rc }}.
+              Check SMPOUT / SMPMSG in the job log.
+          when: receive_rc | int > 4
+
+        - name: "[PHASE 1] Extract and display SMPOUT GIM messages"
+          set_fact:
+            receive_smpout: "{{ receive_job.jobs[0].ddnames
+              | selectattr('ddname', 'equalto', 'SMPOUT')
+              | map(attribute='content')
+              | list | first | default('') }}"
+          when: receive_job.jobs[0].ddnames is defined
+
+        - name: "[PHASE 1] GIM messages from RECEIVE"
+          debug:
+            msg: "{{ ((receive_smpout is string) | ternary(receive_smpout, receive_smpout | join('\n'))) | regex_findall('GIM[0-9]+[A-Z]\\s.+') }}"
+          when: receive_smpout is defined and receive_smpout | length > 0
+
+        - name: "[PHASE 1] Parse received SYSMOD list from SMPOUT"
+          set_fact:
+            # Primary: GIM22701I is the definitive 'RECEIVE WAS SUCCESSFUL FOR SYSMOD X' line.
+            # Fallback: broader SYSMOD\s+ID pattern for non-standard GIM formats.
+            received_sysmod_list: >-
+              {{ (_smpout_text | regex_findall('GIM22701I\s+RECEIVE PROCESSING WAS SUCCESSFUL FOR SYSMOD\s+([A-Z][A-Z0-9]+)'))
+                 or (_smpout_text | regex_findall('SYSMOD\s+([A-Z][A-Z0-9]{4,7})') | unique | sort) }}
+          vars:
+            _smpout_text: "{{ (receive_smpout is string) | ternary(receive_smpout, receive_smpout | join('\n')) }}"
+          when: receive_smpout is defined
+
+        - name: "[PHASE 1] Display received PTF list"
+          debug:
+            msg: |-
+              ══════════════════════════════════════════════════════
+               RECEIVE COMPLETE — {{ received_sysmod_list | default([]) | length }} SYSMODs received
+              ══════════════════════════════════════════════════════
+              {{ received_sysmod_list | default(['(none parsed — review SMPOUT)']) | join(', ') }}
+              ══════════════════════════════════════════════════════
+
+        - name: "[PHASE 1] Set smpe_sysmods from received list"
+          set_fact:
+            smpe_sysmods: "{{ received_sysmod_list }}"
+
+        - name: "[PHASE 1] Save RECEIVE audit log"
+          copy:
+            content: "{{ receive_job | to_nice_json }}"
+            dest: "{{ playbook_dir }}/../logs/internet_receive_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_shell_executable: /bin/bash
+          ignore_errors: true
+
+        - name: "[PHASE 1] Save RECEIVE phase report"
+          copy:
+            content: |-
+              # Phase 1 — RECEIVE Report
+
+              Generated : {{ now(fmt='%Y-%m-%d %H:%M:%S') }}
+              Vendor    : {{ _vendor_key | upper }}
+              SMPCSI    : {{ smpe_csi_dsn }}
+              Target    : {{ smpe_target_zone }}
+              Job       : {{ receive_job.jobs[0].job_name }} ({{ receive_job.jobs[0].job_id }}) RC={{ receive_job.jobs[0].ret_code.code }}
+
+              ## SYSMODs Received — {{ received_sysmod_list | default([]) | length }}
+
+              {{ received_sysmod_list | default([]) | join('\n              ') }}
+            dest: "{{ playbook_dir }}/../logs/phase1_receive_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_shell_executable: /bin/bash
+          register: _phase1_report
+          ignore_errors: true
+          when: not (smpe_test_mode | default(false) | bool)
+
+        - name: "[PHASE 1] RECEIVE phase report saved"
+          debug:
+            msg: "Phase 1 RECEIVE report saved → {{ _phase1_report.dest | default('(not saved)') }}"
+
+        - name: "[PHASE 1] Write RECEIVE cycle marker"
+          shell: |
+            cat > "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_receive.marker" << 'MARKER'
+            vendor={{ _vendor_key }}
+            csi={{ smpe_csi_dsn }}
+            zone={{ smpe_target_zone }}
+            job={{ receive_job.jobs[0].job_id }}
+            rc={{ receive_rc }}
+            timestamp={{ now().strftime('%Y-%m-%dT%H:%M:%S') }}
+            MARKER
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_shell_executable: /bin/bash
+          ignore_errors: true
+          when: not (smpe_test_mode | default(false) | bool)
+
+    # ── PHASE 1 (skip_receive): Load SYSMODs — z/OS spool first, audit log fallback ─
+    # Priority: 1) z/OS spool output of explicit smpe_receive_job_id  2) local audit log file
+
+    - name: "[PHASE 1] Fetch z/OS output for auto-detected RECEIVE ORDER job"
+      ibm.ibm_zos_core.zos_job_output:
+        job_id: "{{ _auto_receive_job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _auto_rcv_output
+      ignore_errors: true
+      failed_when: false
+      when:
+        - skip_receive | default(false) | bool
+        - _auto_receive_job_id | default('') | length > 0
+
+    - name: "[PHASE 1] Extract SYSMODs from auto-detected z/OS job output"
+      vars:
+        _auto_smpout: >-
+          {{ (_auto_rcv_output.jobs[0].ddnames
+              | selectattr('ddname', 'equalto', 'SMPOUT')
+              | map(attribute='content')
+              | list | first | default(''))
+             if ((_auto_rcv_output is defined)
+                 and (_auto_rcv_output.jobs is defined)
+                 and (_auto_rcv_output.jobs | length > 0)
+                 and (_auto_rcv_output.jobs[0].ddnames is defined))
+             else '' }}
+      set_fact:
+        smpe_sysmods: >-
+          {{ ((_auto_smpout is string) | ternary(_auto_smpout, _auto_smpout | join('\n')))
+             | regex_findall('SYSMOD\s+([A-Z][A-Z0-9]{4,7})') | unique | sort }}
+        received_sysmod_list: >-
+          {{ ((_auto_smpout is string) | ternary(_auto_smpout, _auto_smpout | join('\n')))
+             | regex_findall('SYSMOD\s+([A-Z][A-Z0-9]{4,7})') | unique | sort }}
+      when:
+        - skip_receive | default(false) | bool
+        - _auto_receive_job_id | default('') | length > 0
+        - _auto_rcv_output is defined
+        - _auto_rcv_output.jobs is defined
+
+    # Fallback: no z/OS spool job found — try local audit log
+    - name: "[PHASE 1] Find latest RECEIVE audit log (fallback when no spool job)"
+      find:
+        paths: "{{ playbook_dir }}/../logs"
+        patterns: "internet_receive_{{ _vendor_key }}_*.json"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _prev_receive_logs
+      when:
+        - skip_receive | default(false) | bool
+        - smpe_sysmods | default([]) | length == 0
+
+    - name: "[PHASE 1] Fail — no RECEIVE data found (no spool job, no audit log)"
+      fail:
+        msg: >-
+          skip_receive=true but no SYSMODs could be loaded.
+          No completed RECEIVE ORDER job found on the spool and
+          no RECEIVE audit log found in logs/ for vendor '{{ _vendor_key }}'.
+          Run the playbook without skip_receive=true first.
+      when:
+        - skip_receive | default(false) | bool
+        - smpe_sysmods | default([]) | length == 0
+        - _prev_receive_logs.files | default([]) | length == 0
+
+    - name: "[PHASE 1] Load SYSMODs from latest RECEIVE audit log (fallback)"
+      vars:
+        _log_path: "{{ (_prev_receive_logs.files | sort(attribute='mtime') | last).path }}"
+        _log_content: "{{ lookup('file', _log_path) | from_json }}"
+        _log_smpout: >-
+          {{ _log_content.jobs[0].ddnames
+             | selectattr('ddname', 'equalto', 'SMPOUT')
+             | map(attribute='content') | list | first | default('') }}
+      set_fact:
+        smpe_sysmods: >-
+          {{ ((_log_smpout is string) | ternary(_log_smpout, _log_smpout | join('\n')))
+             | regex_findall('SYSMOD\s+([A-Z][A-Z0-9]{4,7})') | unique | sort }}
+        received_sysmod_list: >-
+          {{ ((_log_smpout is string) | ternary(_log_smpout, _log_smpout | join('\n')))
+             | regex_findall('SYSMOD\s+([A-Z][A-Z0-9]{4,7})') | unique | sort }}
+      delegate_to: localhost
+      when:
+        - skip_receive | default(false) | bool
+        - smpe_sysmods | default([]) | length == 0
+        - _prev_receive_logs.files | default([]) | length > 0
+
+    - name: "[PHASE 1] Display loaded PTF list (skip_receive mode)"
+      debug:
+        msg: |-
+          ══════════════════════════════════════════════════════
+           SKIP RECEIVE — {{ smpe_sysmods | default([]) | length }} SYSMODs loaded
+           Source: {{ ('z/OS spool — ' + (_auto_receive_job_id | default('?'))) if (_auto_receive_job_id | default('') | length > 0) else 'local audit log' }}
+          ══════════════════════════════════════════════════════
+          {{ smpe_sysmods | default([]) | join(', ') }}
+          ══════════════════════════════════════════════════════
+      when: skip_receive | default(false) | bool
+
+
+    # ── PHASE 2/3/4 pre-check: Skip to ACCEPT if APPLY already completed ─────────
+    # Pass -e "smpe_apply_job_id=JOBxxxxx" to bypass Phases 2, 3, and 4.
+    # Use when APPLY already ran successfully in a previous run.
+    - name: "[PHASES 2-4] Load completed APPLY job and skip to ACCEPT"
+      block:
+        - name: "[PHASES 2-4] Fetch completed APPLY job output from spool"
+          ibm.ibm_zos_core.zos_job_output:
+            job_id: "{{ smpe_apply_job_id }}"
+          environment: "{{ environment_vars }}"
+          register: _skip_apply_job_out
+
+        - name: "[PHASES 2-4] Extract applied SYSMOD list from existing APPLY job SMPRPT"
+          set_fact:
+            applied_sysmod_list: >-
+              {{ (_skip_apply_smprpt if (_skip_apply_smprpt is not string) else _skip_apply_smprpt.split('\n'))
+                 | select('match', '\s+\S+\s+APPLIED\s+PTF')
+                 | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+                 | list | unique | sort }}
+          vars:
+            _skip_apply_smprpt: "{{ _skip_apply_job_out.jobs[0].ddnames
+              | selectattr('ddname', 'equalto', 'SMPRPT')
+              | map(attribute='content')
+              | list | first | default([]) }}"
+          when: _skip_apply_job_out.jobs[0].ddnames is defined
+
+        - name: "[PHASES 2-4] Set skip_apply=true"
+          set_fact:
+            skip_apply: true
+
+        - name: "[PHASES 2-4] Skip summary — APPLY already completed"
+          debug:
+            msg: |-
+              ══════════════════════════════════════════════════════
+               SKIPPING PHASES 2-4 — smpe_apply_job_id={{ smpe_apply_job_id }}
+               APPLY already ran. Applied SYSMODs loaded from spool.
+               Applied: {{ applied_sysmod_list | default([]) | length }} SYSMODs
+               {{ applied_sysmod_list | default([]) | join(', ') }}
+              ══════════════════════════════════════════════════════
+      when: smpe_apply_job_id | default('') | length > 0
+
+    # ── Early exit: nothing received and nothing pending ─────────────────────
+    - name: "[PHASE 1] No new SYSMODs received — check for pending SYSMODs in SMPPTS"
+      debug:
+        msg: >-
+          GIM24801W — 0 SYSMODs received. RECEIVE ORDER RC={{ receive_rc | default(4) }}.
+          Checking whether previously received SYSMODs remain un-applied before deciding to exit.
+      when:
+        - not (skip_receive | default(false))
+        - smpe_sysmods | default([]) | length == 0
+
+    - name: "[PHASE 1] Write cycle-complete marker — CSI already at current level"
+      copy:
+        content: |
+          vendor={{ _vendor_key }}
+          csi={{ smpe_csi_dsn }}
+          result=NO_NEW_SYSMODS
+          receive_rc={{ receive_rc | default(4) }}
+          timestamp={{ now().strftime('%Y-%m-%dT%H:%M:%S') }}
+        dest: "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_complete.marker"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      when:
+        - not (skip_receive | default(false))
+        - smpe_sysmods | default([]) | length == 0
+        - not (smpe_test_mode | default(false) | bool)
+
+    - name: "[PHASE 1] End play — no new SYSMODs received"
+      meta: end_play
+      when:
+        - not (skip_receive | default(false))
+        - smpe_sysmods | default([]) | length == 0
+
+    # ── PHASES 2+3+4: APPLY CHECK → TECHNICIAN GATE → APPLY ─────────────────
+    - name: "[PHASES 2-4] APPLY CHECK + TECHNICIAN GATE + APPLY"
+      when: not (skip_apply | default(false))
+      block:
+      # ── PHASE 2: APPLY CHECK ─────────────────────────────────────────────────
+      - name: "[PHASE 2] Render APPLY CHECK JCL from template"
+        ansible.builtin.template:
+          src: "{{ playbook_dir }}/../templates/smpe_apply_check.j2"
+          dest: "/tmp/imr_applycheck_{{ inventory_hostname }}.jcl"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+
+      - name: "[PHASE 2] Copy APPLY CHECK JCL to z/OS USS"
+        ibm.ibm_zos_core.zos_copy:
+          src: "/tmp/imr_applycheck_{{ inventory_hostname }}.jcl"
+          dest: "/tmp/imr_applycheck_{{ inventory_hostname }}.jcl"
+          replace: true
+          binary: false
+          encoding:
+            from: UTF-8
+            to: IBM-1047
+        environment: "{{ environment_vars }}"
+
+      - name: "[PHASE 2] Submit APPLY CHECK job"
+        ibm.ibm_zos_core.zos_job_submit:
+          src: "/tmp/imr_applycheck_{{ inventory_hostname }}.jcl"
+          location: uss
+          wait_time: 10
+        environment: "{{ environment_vars }}"
+        register: _applycheck_submit
+        failed_when: false
+
+      - name: "[PHASE 2] Fail if APPLY CHECK could not be submitted"
+        fail:
+          msg: >-
+            APPLY CHECK submission failed — no job_id returned.
+            Check JCL syntax and USS path.
+            Error: {{ _applycheck_submit.msg | default('unknown') }}
+        when: >-
+          _applycheck_submit.jobs is not defined
+          or _applycheck_submit.jobs | length == 0
+          or _applycheck_submit.jobs[0].job_id is not defined
+
+      - name: "[PHASE 2] APPLY CHECK submitted — polling every 10s"
+        debug:
+          msg: >
+            ══ APPLY CHECK submitted ══
+            Job {{ _applycheck_submit.jobs[0].job_name }} ({{ _applycheck_submit.jobs[0].job_id }}) is running.
+            Polling every 10s (max 60 min)...
+
+      - name: "[PHASE 2] Poll APPLY CHECK job until complete"
+        ibm.ibm_zos_core.zos_job_query:
+          job_id: "{{ _applycheck_submit.jobs[0].job_id }}"
+        environment: "{{ environment_vars }}"
+        register: _applycheck_poll
+        failed_when: false
+        until: >
+          _applycheck_poll.jobs is defined
+          and _applycheck_poll.jobs | length > 0
+          and ((_applycheck_poll.jobs[0].ret_code.code | default(none) is not none
+                and _applycheck_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+               or _applycheck_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+        retries: 360
+        delay: 10
+
+      - name: "[PHASE 2] Fetch APPLY CHECK full output"
+        ibm.ibm_zos_core.zos_job_output:
+          job_id: "{{ _applycheck_submit.jobs[0].job_id }}"
+        environment: "{{ environment_vars }}"
+        register: apply_check_job
+
+      - name: "[PHASE 2] APPLY CHECK result"
+        debug:
+          msg: >-
+            Job {{ apply_check_job.jobs[0].job_name }}
+            ({{ apply_check_job.jobs[0].job_id }})
+            RC={{ apply_check_job.jobs[0].ret_code.code }}
+
+      - name: "[PHASE 2] Fail if APPLY CHECK RC > 4"
+        fail:
+          msg: >-
+            APPLY CHECK FAILED —
+            {{ apply_check_job.jobs[0].job_name }}
+            RC={{ apply_check_job.jobs[0].ret_code.code }}.
+            Review SMPOUT for HOLDDATA or prerequisite errors before retrying.
+        when: apply_check_job.jobs[0].ret_code.code | int > 4
+
+      - name: "[PHASE 2] Extract APPLY CHECK SMPOUT"
+        set_fact:
+          apply_check_smpout: "{{ apply_check_job.jobs[0].ddnames
+            | selectattr('ddname', 'equalto', 'SMPOUT')
+            | map(attribute='content')
+            | list | first | default('') }}"
+        when: apply_check_job.jobs[0].ddnames is defined
+
+      - name: "[PHASE 2] Extract APPLY CHECK SMPRPT"
+        set_fact:
+          apply_check_smprpt: "{{ apply_check_job.jobs[0].ddnames
+            | selectattr('ddname', 'equalto', 'SMPRPT')
+            | map(attribute='content')
+            | list | first | default([]) }}"
+        when: apply_check_job.jobs[0].ddnames is defined
+
+      - name: "[PHASE 2] GIM messages from APPLY CHECK"
+        debug:
+          msg: "{{ apply_check_smpout | regex_findall('GIM[0-9]+.*') }}"
+        when: apply_check_smpout is defined and apply_check_smpout | length > 0
+
+      - name: "[PHASE 2] Save APPLY CHECK audit log"
+        copy:
+          content: "{{ apply_check_job | to_nice_json }}"
+          dest: "{{ playbook_dir }}/../logs/internet_applycheck_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        ignore_errors: true
+
+      - name: "[PHASE 2] Parse APPLY CHECK approved and blocked SYSMODs"
+        vars:
+          _smpout_str: >-
+            {{ apply_check_smpout | join('\n') }}
+        set_fact:
+          applycheck_approved_list: >-
+            {{ apply_check_smprpt
+               | select('match', '\s+\S+\s+APPLIED\s+PTF')
+               | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+               | list | unique | sort }}
+          applycheck_blocked_msgs: >-
+            {{ _smpout_str | regex_findall('GIM(?:35101|61303|43001|39109)[EW][^\n]*') }}
+        when: apply_check_smprpt is defined
+
+      - name: "[PHASE 2] Compute SYSMODs not scheduled for APPLY"
+        set_fact:
+          not_applied_sysmods: >-
+            {{ received_sysmod_list | default([]) | difference(applycheck_approved_list | default([])) }}
+
+      - name: "[PHASE 2] Generate APPLY CHECK detail report"
+        shell: |
+          python3 << 'PYEOF'
+          import json, re, glob
+
+          log = sorted(glob.glob('{{ playbook_dir }}/../logs/internet_applycheck_{{ _vendor_key }}_*.json'))[-1]
+          with open(log) as f:
+              data = json.load(f)
+
+          dd_map = {dd['ddname']: dd['content'] for dd in data['jobs'][0]['ddnames']}
+          def to_str(c): return '\n'.join(c) if isinstance(c, list) else (c or '')
+
+          smprpt = to_str(dd_map.get('SMPRPT', ''))
+
+          # Jinja2-injected lists
+          received   = {{ received_sysmod_list   | default([]) | to_json }}
+          not_queued = {{ not_applied_sysmods    | default([]) | to_json }}
+          to_apply   = [s for s in received if s not in not_queued]
+
+          # --- Parse SYSMOD STATUS REPORT from SMPRPT ---
+          # Line format: '  SYSMOD   STATUS   TYPE    FMID   rest...'
+          def get_smprpt(sid):
+              m = re.search(r'^\s{1,4}' + re.escape(sid) + r'\s+(\S+)\s+(\S+)\s+([A-Z][A-Z0-9]{5,7})?',
+                            smprpt, re.MULTILINE)
+              if m:
+                  return m.group(1), m.group(2), m.group(3) or '-'
+              return 'UNKNOWN', '-', '-'
+
+          def get_supby_ptf(sid):
+              m = re.search(r'^\s{1,4}' + re.escape(sid) + r'\s+SUPD\s+\S+\s+SUPBY\s+(\S+)',
+                            smprpt, re.MULTILINE)
+              return m.group(1) if m else '?'
+
+          def get_ifreq_note(sid):
+              m = re.search(r'^\s{1,4}' + re.escape(sid) + r'\s+\S+\s+\S+\s+\S+\s+IFREQ\s+([^\n]+)',
+                            smprpt, re.MULTILINE)
+              return m.group(1).strip() if m else None
+
+          # Categorise not-queued SYSMODs
+          already, superseded_list = [], []
+          for s in sorted(not_queued):
+              status, stype, fmid = get_smprpt(s)
+              if status == 'SUPD':
+                  superseded_list.append((s, fmid, stype, get_supby_ptf(s)))
+              else:
+                  already.append((s, fmid, stype))
+
+          # IFREQ notes for SYSMODs that will be applied with conditions bypassed
+          ifreq_notes = {}
+          for s in to_apply:
+              note = get_ifreq_note(s)
+              if note:
+                  ifreq_notes[s] = note
+
+          # Parse bypassed HOLDs from ++HOLD statements in SMPRPT
+          bypass_entries, seen_bypass = [], set()
+          for m in re.finditer(
+                  r'\+\+HOLD\(([A-Z][A-Z0-9]{4,7})\)\s+SYSTEM\s+FMID\((\S+)\)\s+REASON\((\S+)\)',
+                  smprpt):
+              key = (m.group(1), m.group(3))
+              if key not in seen_bypass:
+                  seen_bypass.add(key)
+                  bypass_entries.append({'sysmod': m.group(1), 'fmid': m.group(2), 'reason': m.group(3)})
+
+          # --- Format report ---
+          job  = data['jobs'][0]
+          SEP  = '=' * 62
+          SEP2 = '-' * 62
+
+          print(SEP)
+          print(f'  APPLY CHECK DETAIL REPORT')
+          print(f'  Job  : {job["job_name"]} ({job["job_id"]})   RC: {job["ret_code"]["code"]}')
+          print(f'  CSI  : {{ smpe_csi_dsn }}')
+          print(f'  Zone : {{ smpe_target_zone }}')
+          print(SEP)
+
+          # Section 1 — WILL BE APPLIED
+          print()
+          print(f'  WILL BE APPLIED FROM THIS DELIVERY  ({len(to_apply)} SYSMODs)')
+          print(SEP2)
+          if to_apply:
+              print(f'  {"SYSMOD":<10} {"FMID":<10} {"TYPE":<6}  NOTES')
+              print(f'  {"-"*10} {"-"*10} {"-"*6}  {"-"*30}')
+              for s in sorted(to_apply):
+                  _, stype, fmid = get_smprpt(s)
+                  note = f'IFREQ bypassed: {ifreq_notes[s]}' if s in ifreq_notes else ''
+                  print(f'  {s:<10} {fmid:<10} {stype:<6}  {note}')
+          else:
+              print('  (none — all received SYSMODs already applied or superseded)')
+
+          # Section 2 — NOT QUEUED
+          print()
+          print(f'  NOT QUEUED FROM THIS DELIVERY  ({len(not_queued)} SYSMODs)')
+          print(SEP2)
+
+          if already:
+              print(f'  Already at current level in {{ smpe_target_zone }}  ({len(already)}):')
+              print(f'  {"SYSMOD":<10} {"FMID":<10} {"TYPE":<6}')
+              print(f'  {"-"*10} {"-"*10} {"-"*6}')
+              for s, fmid, stype in already:
+                  print(f'  {s:<10} {fmid:<10} {stype:<6}')
+
+          if superseded_list:
+              print()
+              print(f'  Superseded by higher-level PTF  ({len(superseded_list)}):')
+              print(f'  {"SYSMOD":<10} {"FMID":<10} {"TYPE":<6}  SUPERSEDED BY')
+              print(f'  {"-"*10} {"-"*10} {"-"*6}  {"-"*14}')
+              for s, fmid, stype, by in superseded_list:
+                  print(f'  {s:<10} {fmid:<10} {stype:<6}  {by}')
+
+          # Section 3 — HOLDDATA BYPASSED
+          if bypass_entries:
+              print()
+              print(f'  HOLDDATA bypassed during APPLY CHECK  ({len(bypass_entries)} hold actions):')
+              print(f'  {"SYSMOD":<10} {"FMID":<10} {"REASON":<10}')
+              print(f'  {"-"*10} {"-"*10} {"-"*10}')
+              for e in bypass_entries:
+                  print(f'  {e["sysmod"]:<10} {e["fmid"]:<10} {e["reason"]:<10}')
+
+          print()
+          print(SEP)
+          PYEOF
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        register: _detail_report
+
+      - name: "[PHASE 2] Display APPLY CHECK detail report"
+        debug:
+          msg: "{{ _detail_report.stdout }}"
+
+      - name: "[PHASE 2] Save APPLY CHECK phase report"
+        copy:
+          content: "{{ _detail_report.stdout }}"
+          dest: "{{ playbook_dir }}/../logs/phase2_applycheck_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        register: _phase2_report
+        ignore_errors: true
+        when: not (smpe_test_mode | default(false) | bool)
+
+      - name: "[PHASE 2] APPLY CHECK phase report saved"
+        debug:
+          msg: "Phase 2 APPLY CHECK report saved → {{ _phase2_report.dest | default('(not saved)') }}"
+
+      - name: "[PHASE 2] Display GIM blocking messages (reasons not applied)"
+        debug:
+          msg: "{{ item }}"
+        loop: "{{ applycheck_blocked_msgs | default([]) }}"
+        when: applycheck_blocked_msgs | default([]) | length > 0
+
+      # ── PHASE 2e: HOLDDATA BYPASS ACTION PLAN ───────────────────────────────
+      - name: "[PHASE 2] Generate HOLD bypass action plan"
+        shell: |
+          python3 << 'PYEOF'
+          import json, re, glob, datetime
+
+          log_files = sorted(glob.glob('{{ playbook_dir }}/../logs/internet_applycheck_{{ _vendor_key }}_*.json'))
+          if not log_files:
+              print('# HOLD Bypass Report\n\n_No APPLY CHECK log found._\n\n__BYPASS_COUNT__:0')
+              exit(0)
+
+          with open(log_files[-1]) as f:
+              data = json.load(f)
+
+          dd_map = {dd['ddname']: dd['content'] for dd in data['jobs'][0]['ddnames']}
+          def to_str(c): return '\n'.join(c) if isinstance(c, list) else (c or '')
+
+          smprpt = to_str(dd_map.get('SMPRPT', ''))
+          smpout  = to_str(dd_map.get('SMPOUT', ''))
+          job     = data['jobs'][0]
+
+          hold_entries, seen = [], set()
+
+          # ++HOLD statements from SMPRPT
+          for m in re.finditer(
+                  r'\+\+HOLD\(([A-Z][A-Z0-9]{4,7})\)\s+SYSTEM\s+FMID\((\S+)\)\s+REASON\((\S+)\)',
+                  smprpt, re.IGNORECASE):
+              key = (m.group(1), m.group(3))
+              if key not in seen:
+                  seen.add(key)
+                  hold_entries.append({'sysmod': m.group(1), 'fmid': m.group(2),
+                                       'reason': m.group(3), 'detail': 'SMPRPT ++HOLD statement'})
+
+          # GIM HOLD messages from SMPOUT
+          for m in re.finditer(
+                  r'(GIM(?:61303|35101|43001|39109)[EW][^\n]+)',
+                  smpout):
+              msg = m.group(1).strip()
+              if msg not in seen:
+                  seen.add(msg)
+                  sm = re.search(r'\b([A-Z]{2}[0-9A-Z]{5,7})\b', msg)
+                  hold_entries.append({'sysmod': sm.group(1) if sm else '?',
+                                       'fmid': '-', 'reason': 'GIM-HOLD',
+                                       'detail': msg[:120]})
+
+          ts  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+          out = [
+              '# SMP/E APPLY CHECK \u2014 HOLDDATA Bypass Action Plan', '',
+              '| Field | Value |', '|-------|-------|',
+              f'| **Date** | {ts} |',
+              f'| **Vendor** | {{ _vendor_key | upper }} |',
+              f'| **SMPCSI** | {{ smpe_csi_dsn }} |',
+              f'| **Target Zone** | {{ smpe_target_zone }} |',
+              f'| **Job** | {job["job_name"]} ({job["job_id"]}) RC={job["ret_code"]["code"]} |',
+               '| **Bypass clause** | `BYPASS(HOLDSYS)` |',
+              '', '---', '', '## Bypassed HOLD Actions', '',
+          ]
+
+          if hold_entries:
+              out += [
+                  '| # | SYSMOD | FMID | Hold Reason | Detail |',
+                  '|---|--------|------|-------------|--------|',
+              ]
+              for i, e in enumerate(hold_entries, 1):
+                  out.append(f'| {i} | `{e["sysmod"]}` | {e["fmid"]} | {e["reason"]} | {e["detail"]} |')
+              out += ['',
+                  f'> \u26a0\ufe0f  **{len(hold_entries)} HOLD bypass action(s) require technician sign-off.**']
+          else:
+              out += [
+                  '\u2705 **No HOLDSYS bypass actions for this delivery.**',
+                  '',
+                  '_The APPLY CHECK completed without any system HOLD conditions being bypassed._',
+              ]
+
+          out += [
+              '', '---', '', '## Technician Acknowledgment', '',
+              'By typing `yes` at the Phase 3 gate, the technician confirms:', '',
+              '- [ ] HOLD bypass actions reviewed (or none required)',
+              '- [ ] Change record updated to reflect any HOLD bypass decisions',
+              '- [ ] IBM documentation / APAR references consulted as applicable',
+              '- [ ] Bypass is authorized per change management policy',
+              '', '---', '',
+              f'__BYPASS_COUNT__:{len(hold_entries)}',
+          ]
+          print('\n'.join(out))
+          PYEOF
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        register: _hold_bypass_report
+        ignore_errors: true
+
+      - name: "[PHASE 2] Parse HOLD bypass count"
+        set_fact:
+          hold_bypass_count: "{{ _hold_bypass_report.stdout | default('') | regex_search('__BYPASS_COUNT__:(\\d+)', '\\1') | first | default('0') | int }}"
+
+      - name: "[PHASE 2] Save HOLD bypass action plan"
+        copy:
+          content: "{{ _hold_bypass_report.stdout | default('') | regex_replace('\n__BYPASS_COUNT__:\\d+\n?$', '') }}"
+          dest: "{{ playbook_dir }}/../logs/phase2_holdbypass_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        register: _hold_bypass_file
+        ignore_errors: true
+
+      - name: "[PHASE 2] HOLD bypass plan saved"
+        debug:
+          msg: "HOLD Bypass Action Plan → {{ _hold_bypass_file.dest | default('(not saved)') }}  ({{ hold_bypass_count }} hold action(s))"
+
+      # Cross-check SMPRPT-approved SYSMODs against APPLY/ACCEPT audit logs to
+      # exclude SYSMODs already applied in a previous run. SMPRPT shows STATUS=APPLIED
+      # for both 'will be applied' and 'already applied' SYSMODs identically.
+      # Trust SMP/E APPLY CHECK as authoritative. If APPLY CHECK approved >0 SYSMODs
+      # (RC=0/4), proceed to the technician gate. A local cross-check against historical
+      # logs was removed because it did not filter by CSI and produced false positives
+      # when the same PTF IDs appeared in logs from other products' CSIs.
+      - name: "[PHASE 2] Set applycheck_new_to_apply_count from APPLY CHECK approved list"
+        set_fact:
+          applycheck_new_to_apply_count: "{{ applycheck_approved_list | default([]) | length }}"
+
+      - name: "[PHASE 2] No new SYSMODs to apply — maintenance complete"
+        debug:
+          msg: |-
+            ══════════════════════════════════════════════════════
+             MAINTENANCE COMPLETE — NOTHING NEW TO APPLY
+            ══════════════════════════════════════════════════════
+             APPLY CHECK RC  : {{ apply_check_job.jobs[0].ret_code.code | default('0') }}
+             New to apply    : 0 SYSMODs
+             All SYSMODs in SMPPTS are already at the current level
+             in TARGET zone {{ smpe_target_zone }}. No APPLY required.
+            ══════════════════════════════════════════════════════
+        when: applycheck_new_to_apply_count | int == 0
+
+      - name: "[PHASE 2] Write cycle-complete marker (CSI already at current level)"
+        shell: |
+          cat > "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_accept.marker" << 'MARKER'
+          vendor={{ _vendor_key }}
+          csi={{ smpe_csi_dsn }}
+          zone={{ smpe_target_zone }}
+          timestamp={{ now().strftime('%Y-%m-%dT%H:%M:%S') }}
+          result=MAINTENANCE_COMPLETE_NO_NEW_SYSMODS
+          MARKER
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        ignore_errors: true
+        when: applycheck_new_to_apply_count | int == 0 and not (smpe_test_mode | default(false) | bool)
+
+      - name: "[PHASE 2] End play — nothing new to apply"
+        meta: end_play
+        when: applycheck_new_to_apply_count | int == 0
+
+      # ── PHASE 3: TECHNICIAN REVIEW GATE (file-based — surfaced through chat) ──
+      - name: "[PHASE 3] Clean stale gate markers"
+        file:
+          path: "{{ item }}"
+          state: absent
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        loop:
+          - "{{ playbook_dir }}/../logs/gate_apply_pending.marker"
+          - "{{ playbook_dir }}/../logs/gate_apply_confirmed.marker"
+
+      - name: "[PHASE 3] Write APPLY gate pending marker"
+        copy:
+          content: |
+            gate=apply
+            vendor={{ _vendor_key | upper }}
+            csi={{ smpe_csi_dsn }}
+            target_zone={{ smpe_target_zone }}
+            dlib_zone={{ smpe_dlib_zone }}
+            job={{ apply_check_job.jobs[0].job_name }} ({{ apply_check_job.jobs[0].job_id }})
+            rc={{ apply_check_job.jobs[0].ret_code.code }}
+            received={{ received_sysmod_list | default([]) | length }}
+            to_apply={{ applycheck_new_to_apply_count | default(applycheck_approved_list | default([]) | length) }}
+            not_queued={{ not_applied_sysmods | default([]) | length }}
+            hold_bypasses={{ hold_bypass_count | default(0) }}
+            status=PENDING
+          dest: "{{ playbook_dir }}/../logs/gate_apply_pending.marker"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+
+      - name: "[PHASE 3] APPLY gate — waiting for confirmation via chat"
+        debug:
+          msg: |
+            ══════════════════════════════════════════════════════
+             APPLY GATE PENDING — AWAITING TECHNICIAN CONFIRMATION
+            ══════════════════════════════════════════════════════
+             Gate marker : logs/gate_apply_pending.marker
+             Approve     : echo 'yes' > logs/gate_apply_confirmed.marker
+             Abort       : echo 'no'  > logs/gate_apply_confirmed.marker
+             Timeout     : 60 minutes
+            ══════════════════════════════════════════════════════
+
+      - name: "[PHASE 3] Wait for technician confirmation (max 60 min)"
+        wait_for:
+          path: "{{ playbook_dir }}/../logs/gate_apply_confirmed.marker"
+          timeout: 3600
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+
+      - name: "[PHASE 3] Read technician decision"
+        slurp:
+          src: "{{ playbook_dir }}/../logs/gate_apply_confirmed.marker"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        register: _apply_gate_decision
+
+      - name: "[PHASE 3] Clean up gate markers"
+        file:
+          path: "{{ item }}"
+          state: absent
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        loop:
+          - "{{ playbook_dir }}/../logs/gate_apply_pending.marker"
+          - "{{ playbook_dir }}/../logs/gate_apply_confirmed.marker"
+
+      - name: "[PHASE 3] Abort if technician did not confirm"
+        fail:
+          msg: >-
+            APPLY aborted by technician.
+            Review APPLY CHECK output before re-running this playbook.
+        when: (_apply_gate_decision.content | b64decode | trim | lower) != 'yes'
+
+      # ── PHASE 4: APPLY ───────────────────────────────────────────────────────
+      - name: "[PHASE 4] Render APPLY JCL from template — SYSSA69.SMPE.JCLLIB(SMPAPLY1)"
+        ansible.builtin.template:
+          src: "{{ playbook_dir }}/../templates/smpe_apply_check.j2"
+          dest: "/tmp/imr_apply_{{ inventory_hostname }}.jcl"
+        delegate_to: localhost
+        vars:
+          apply_check_mode: false
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+
+      - name: "[PHASE 4] Copy APPLY JCL to z/OS USS"
+        ibm.ibm_zos_core.zos_copy:
+          src: "/tmp/imr_apply_{{ inventory_hostname }}.jcl"
+          dest: "/tmp/imr_apply_{{ inventory_hostname }}.jcl"
+          replace: true
+          binary: false
+          encoding:
+            from: UTF-8
+            to: IBM-1047
+        environment: "{{ environment_vars }}"
+
+      - name: "[PHASE 4] Submit APPLY job — SYSSA69.SMPE.JCLLIB(SMPAPLY1)"
+        ibm.ibm_zos_core.zos_job_submit:
+          src: "/tmp/imr_apply_{{ inventory_hostname }}.jcl"
+          location: uss
+          wait_time: 10
+        environment: "{{ environment_vars }}"
+        register: _apply_submit
+        failed_when: false
+
+      - name: "[PHASE 4] Fail if APPLY could not be submitted"
+        fail:
+          msg: >-
+            APPLY submission failed — no job_id returned.
+            Check JCL syntax and USS path.
+            Error: {{ _apply_submit.msg | default('unknown') }}
+        when: >-
+          _apply_submit.jobs is not defined
+          or _apply_submit.jobs | length == 0
+          or _apply_submit.jobs[0].job_id is not defined
+
+      - name: "[PHASE 4] APPLY submitted — polling every 10s"
+        debug:
+          msg: >
+            ══ APPLY submitted ══
+            Job {{ _apply_submit.jobs[0].job_name }} ({{ _apply_submit.jobs[0].job_id }}) is running.
+            Polling every 10s (max 2 hours)...
+
+      - name: "[PHASE 4] Poll APPLY job until complete"
+        ibm.ibm_zos_core.zos_job_query:
+          job_id: "{{ _apply_submit.jobs[0].job_id }}"
+        environment: "{{ environment_vars }}"
+        register: _apply_poll
+        failed_when: false
+        until: >
+          _apply_poll.jobs is defined
+          and _apply_poll.jobs | length > 0
+          and ((_apply_poll.jobs[0].ret_code.code | default(none) is not none
+                and _apply_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+               or _apply_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+        retries: 720  # 2 hours at 10s intervals (large APPLY operations can take 60+ min)
+        delay: 10
+
+      - name: "[PHASE 4] Capture APPLY RC from poll result"
+        set_fact:
+          apply_rc: >-
+            {{ _apply_poll.jobs[0].ret_code.code | int
+               if (_apply_poll.jobs[0].ret_code is defined
+                   and _apply_poll.jobs[0].ret_code.code is not none
+                   and _apply_poll.jobs[0].ret_code.code | string != 'None')
+               else ((_apply_poll.jobs[0].ret_code.msg | default('CC 0000'))
+                     | regex_replace('^CC\s+0*(\d+).*', '\1') | default('0')) | int }}
+
+      - name: "[PHASE 4] Fetch APPLY full output"
+        ibm.ibm_zos_core.zos_job_output:
+          job_id: "{{ _apply_submit.jobs[0].job_id }}"
+        environment: "{{ environment_vars }}"
+        register: apply_job
+
+      - name: "[PHASE 4] Guard — fail if APPLY job still active after output fetch"
+        fail:
+          msg: >-
+            APPLY job {{ apply_job.jobs[0].job_id }} reports status
+            '{{ apply_job.jobs[0].status | default('unknown') }}' — job still running.
+            ACCEPT will not proceed.
+        when: apply_job.jobs[0].status | default('') | upper in ['AC', 'ACTIVE']
+
+      - name: "[PHASE 4] APPLY result"
+        debug:
+          msg: >-
+            Job {{ apply_job.jobs[0].job_name }}
+            ({{ apply_job.jobs[0].job_id }})
+            RC={{ apply_rc }}
+
+      - name: "[PHASE 4] Fail if APPLY RC > 4"
+        fail:
+          msg: >-
+            APPLY FAILED —
+            {{ apply_job.jobs[0].job_name }}
+            RC={{ apply_rc }}.
+            Do NOT re-run. Check SMPOUT/SMPMSG and raise a change record
+            before initiating rollback.
+        when: apply_rc | int > 4
+
+      - name: "[PHASE 4] Extract APPLY SMPOUT"
+        set_fact:
+          apply_smpout: "{{ apply_job.jobs[0].ddnames
+            | selectattr('ddname', 'equalto', 'SMPOUT')
+            | map(attribute='content')
+            | list | first | default('') }}"
+        when: apply_job.jobs[0].ddnames is defined
+
+      - name: "[PHASE 4] Extract APPLY SMPRPT"
+        set_fact:
+          apply_smprpt: "{{ apply_job.jobs[0].ddnames
+            | selectattr('ddname', 'equalto', 'SMPRPT')
+            | map(attribute='content')
+            | list | first | default([]) }}"
+        when: apply_job.jobs[0].ddnames is defined
+
+      - name: "[PHASE 4] GIM messages from APPLY"
+        debug:
+          msg: "{{ apply_smpout | regex_findall('GIM[0-9]+.*') }}"
+        when: apply_smpout is defined and apply_smpout | length > 0
+
+      - name: "[PHASE 4] Parse applied SYSMOD list from SMPRPT"
+        set_fact:
+          applied_sysmod_list: >-
+            {{ (apply_smprpt if (apply_smprpt is not string) else apply_smprpt.split('\n'))
+               | select('match', '\s+\S+\s+APPLIED\s+PTF')
+               | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+               | list | unique | sort }}
+        when: apply_smprpt is defined
+
+      - name: "[PHASE 4] Display RECEIVE vs APPLY comparison"
+        debug:
+          msg: |-
+            ══════════════════════════════════════════════════════
+             APPLY COMPLETE — RECEIVE vs APPLY Comparison
+            ══════════════════════════════════════════════════════
+             Received : {{ received_sysmod_list | default([]) | length }} SYSMODs
+             Applied  : {{ applied_sysmod_list  | default([]) | length }} SYSMODs
+             Delta    : {{ received_sysmod_list | default([]) | difference(applied_sysmod_list | default([])) | length }} not applied
+             Delta    : {{ received_sysmod_list | default([]) | difference(applied_sysmod_list | default([])) | join(' ') or 'none' }}
+            ══════════════════════════════════════════════════════
+
+      - name: "[PHASE 4] Save APPLY audit log"
+        copy:
+          content: "{{ apply_job | to_nice_json }}"
+          dest: "{{ playbook_dir }}/../logs/internet_apply_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        ignore_errors: true
+
+      - name: "[PHASE 4] Write APPLY cycle marker"
+        shell: |
+          cat > "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_apply.marker" << 'MARKER'
+          vendor={{ _vendor_key }}
+          csi={{ smpe_csi_dsn }}
+          zone={{ smpe_target_zone }}
+          job={{ apply_job.jobs[0].job_id }}
+          rc={{ apply_rc }}
+          applied={{ applied_sysmod_list | default([]) | join(' ') }}
+          timestamp={{ now().strftime('%Y-%m-%dT%H:%M:%S') }}
+          MARKER
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        ignore_errors: true
+        when: not (smpe_test_mode | default(false) | bool)
+
+      - name: "[PHASE 4] Save APPLY phase report"
+        copy:
+          content: |-
+            # Phase 4 — APPLY Report
+
+            Generated   : {{ now(fmt='%Y-%m-%d %H:%M:%S') }}
+            Vendor      : {{ _vendor_key | upper }}
+            SMPCSI      : {{ smpe_csi_dsn }}
+            Target      : {{ smpe_target_zone }}
+            Job         : {{ apply_job.jobs[0].job_name }} ({{ apply_job.jobs[0].job_id }}) RC={{ apply_job.jobs[0].ret_code.code }}
+            Received    : {{ received_sysmod_list | default([]) | length }} SYSMODs
+            Applied     : {{ applied_sysmod_list | default([]) | length }} SYSMODs
+            Not applied : {{ received_sysmod_list | default([]) | difference(applied_sysmod_list | default([])) | join(' ') or 'none' }}
+
+            ## Applied SYSMODs — {{ applied_sysmod_list | default([]) | length }}
+
+            {{ applied_sysmod_list | default([]) | join('\n          ') }}
+          dest: "{{ playbook_dir }}/../logs/phase4_apply_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+        delegate_to: localhost
+        vars:
+          ansible_connection: local
+          ansible_shell_executable: /bin/bash
+        register: _phase4_report
+        ignore_errors: true
+        when: not (smpe_test_mode | default(false) | bool)
+
+      - name: "[PHASE 4] APPLY phase report saved"
+        debug:
+          msg: "Phase 4 APPLY report saved → {{ _phase4_report.dest | default('(not saved)') }}"
+
+      # ── PHASE 4: Summary ────────────────────────────────────────────────────
+      - name: "[PHASE 4] APPLY complete"
+        debug:
+          msg: |-
+            ══════════════════════════════════════════════════════
+             APPLY COMPLETE — Received: {{ received_sysmod_list | default([]) | length }}  Applied: {{ applied_sysmod_list | default([]) | length }}
+             RECEIVE RC : {{ receive_job.jobs[0].ret_code.code if (receive_job is defined and receive_job.jobs is defined) else 'N/A (skipped)' }}
+             APPLYCK RC : {{ apply_check_job.jobs[0].ret_code.code }}
+             APPLY RC   : {{ apply_rc }}
+            ══════════════════════════════════════════════════════
+
+      # ── PHASE 5: ACCEPT CHECK ─────────────────────────────────────────────────
+      # end of [PHASES 2-4] block
+
+    # ── PHASE 5 pre-check: Skip ACCEPT pipeline if ACCEPT already completed ─────
+    # Pass -e "smpe_accept_job_id=JOBxxxxx" to bypass ACCEPT CHECK and ACCEPT.
+    - name: "[PHASE 5] Load completed ACCEPT job and skip ACCEPT pipeline"
+      block:
+        - name: "[PHASE 5] Fetch completed ACCEPT job output from spool"
+          ibm.ibm_zos_core.zos_job_output:
+            job_id: "{{ smpe_accept_job_id }}"
+          environment: "{{ environment_vars }}"
+          register: _skip_accept_job_out
+
+        - name: "[PHASE 5] Extract data from existing ACCEPT job SMPRPT"
+          set_fact:
+            accepted_sysmod_list: >-
+              {{ (_skip_accept_smprpt if (_skip_accept_smprpt is not string) else _skip_accept_smprpt.split('\n'))
+                 | select('match', '\s+\S+\s+ACCEPTED\s+PTF')
+                 | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+                 | list | unique | sort }}
+            acceptcheck_approved_list: >-
+              {{ (_skip_accept_smprpt if (_skip_accept_smprpt is not string) else _skip_accept_smprpt.split('\n'))
+                 | select('match', '\s+\S+\s+ACCEPTED\s+PTF')
+                 | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+                 | list | unique | sort }}
+            accept_job_rc: "{{ _skip_accept_job_out.jobs[0].ret_code.code }}"
+          vars:
+            _skip_accept_smprpt: "{{ _skip_accept_job_out.jobs[0].ddnames
+              | selectattr('ddname', 'equalto', 'SMPRPT')
+              | map(attribute='content')
+              | list | first | default([]) }}"
+          when: _skip_accept_job_out.jobs[0].ddnames is defined
+
+        - name: "[PHASE 5] Set skip_accept=true"
+          set_fact:
+            skip_accept: true
+
+        - name: "[PHASE 5] Skip summary — ACCEPT already completed"
+          debug:
+            msg: |-
+              ══════════════════════════════════════════════════════
+               SKIPPING PHASE 5 — smpe_accept_job_id={{ smpe_accept_job_id }}
+               ACCEPT already ran. Accepted SYSMODs loaded from spool.
+               Accepted: {{ accepted_sysmod_list | default([]) | length }} SYSMODs
+               {{ accepted_sysmod_list | default([]) | join(', ') }}
+              ══════════════════════════════════════════════════════
+      when: smpe_accept_job_id | default('') | length > 0
+
+    - name: "[PHASE 5] Render ACCEPT CHECK JCL from template"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/smpe_accept.j2"
+        dest: "/tmp/imr_acceptck_{{ inventory_hostname }}.jcl"
+      delegate_to: localhost
+      vars:
+        accept_check_mode: true
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Copy ACCEPT CHECK JCL to z/OS USS"
+      ibm.ibm_zos_core.zos_copy:
+        src: "/tmp/imr_acceptck_{{ inventory_hostname }}.jcl"
+        dest: "/tmp/imr_acceptck_{{ inventory_hostname }}.jcl"
+        replace: true
+        binary: false
+        encoding:
+          from: UTF-8
+          to: IBM-1047
+      environment: "{{ environment_vars }}"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Submit ACCEPT CHECK job"
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "/tmp/imr_acceptck_{{ inventory_hostname }}.jcl"
+        location: uss
+        wait_time: 10
+      environment: "{{ environment_vars }}"
+      register: _acceptck_submit
+      failed_when: false
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Fail if ACCEPT CHECK could not be submitted"
+      fail:
+        msg: >-
+          ACCEPT CHECK submission failed — no job_id returned.
+          Error: {{ _acceptck_submit.msg | default('unknown') }}
+      when: >-
+        not (skip_accept | default(false))
+        and (_acceptck_submit.jobs is not defined
+             or _acceptck_submit.jobs | length == 0
+             or _acceptck_submit.jobs[0].job_id is not defined)
+
+    - name: "[PHASE 5] ACCEPT CHECK submitted — polling every 10s"
+      debug:
+        msg: >
+          ══ ACCEPT CHECK submitted ══
+          Job {{ _acceptck_submit.jobs[0].job_name }} ({{ _acceptck_submit.jobs[0].job_id }}) is running.
+          Polling every 10s (max 60 min)...
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Poll ACCEPT CHECK job until complete"
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _acceptck_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _acceptck_poll
+      failed_when: false
+      until: >
+        _acceptck_poll.jobs is defined
+        and _acceptck_poll.jobs | length > 0
+        and ((_acceptck_poll.jobs[0].ret_code.code | default(none) is not none
+              and _acceptck_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+             or _acceptck_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+      retries: 360
+      delay: 10
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Fetch ACCEPT CHECK full output"
+      ibm.ibm_zos_core.zos_job_output:
+        job_id: "{{ _acceptck_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: accept_check_job
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] ACCEPT CHECK result"
+      debug:
+        msg: >-
+          Job {{ accept_check_job.jobs[0].job_name }}
+          ({{ accept_check_job.jobs[0].job_id }})
+          RC={{ accept_check_job.jobs[0].ret_code.code }}
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Fail if ACCEPT CHECK RC > 4"
+      fail:
+        msg: >-
+          ACCEPT CHECK FAILED — {{ accept_check_job.jobs[0].job_name }}
+          RC={{ accept_check_job.jobs[0].ret_code.code }}.
+          Review SMPOUT before proceeding.
+      when: not (skip_accept | default(false)) and accept_check_job.jobs[0].ret_code.code | int > 4
+
+    - name: "[PHASE 5] Extract ACCEPT CHECK SMPOUT"
+      set_fact:
+        accept_check_smpout: "{{ accept_check_job.jobs[0].ddnames
+          | selectattr('ddname', 'equalto', 'SMPRPT')
+          | map(attribute='content')
+          | list | first | default([]) }}"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Build ACCEPT CHECK detail report"
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import re, sys
+        SEP = '══════════════════════════════════════════════════════'
+        lines = {{ accept_check_smpout | to_json }}
+        text  = '\n'.join(lines) if isinstance(lines, list) else str(lines)
+
+        # Parse SMPRPT SYSMOD STATUS REPORT — ACCEPTED PTF entries
+        will_accept = re.findall(
+            r'^\s+(\S+)\s+ACCEPTED\s+PTF\s+\S+',
+            text, re.MULTILINE)
+        will_accept = sorted(set(will_accept))
+
+        # SUPD = superseded — not selected
+        already = re.findall(
+            r'^\s+(\S+)\s+SUPD\s+',
+            text, re.MULTILINE)
+        already = sorted(set(already))
+
+        print()
+        print(SEP)
+        print(' ACCEPT CHECK REPORT')
+        print(f' SMPCSI    : {{ smpe_csi_dsn }}')
+        print(f' Dlib zone : {{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}')
+        print(f' Job       : {{ accept_check_job.jobs[0].job_name }} ({{ accept_check_job.jobs[0].job_id }})  RC={{ accept_check_job.jobs[0].ret_code.code }}')
+        print(SEP)
+        print(f'  Will be ACCEPTED         : {len(will_accept):>4} SYSMODs')
+        print(f'  Superseded (not selected): {len(already):>4} SYSMODs')
+        print(SEP)
+        if will_accept:
+            print()
+            print('  SYSMODs queued for ACCEPT:')
+            for i, s in enumerate(will_accept, 1):
+                print(f'    {i:>3}. {s}')
+        print(SEP)
+        PYEOF
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _acceptck_report
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Display ACCEPT CHECK detail report"
+      debug:
+        msg: "{{ _acceptck_report.stdout }}"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Save ACCEPT CHECK phase report"
+      copy:
+        content: "{{ _acceptck_report.stdout }}"
+        dest: "{{ playbook_dir }}/../logs/phase5_acceptcheck_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _phase5a_report
+      ignore_errors: true
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] ACCEPT CHECK phase report saved"
+      debug:
+        msg: "Phase 5 ACCEPT CHECK report saved → {{ _phase5a_report.dest | default('(not saved)') }}"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Extract approved ACCEPT list"
+      set_fact:
+        acceptcheck_approved_list: >-
+          {{ (accept_check_smpout if (accept_check_smpout is not string) else accept_check_smpout.split('\n'))
+             | select('match', '\s+\S+\s+ACCEPTED\s+PTF')
+             | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+             | list | unique | sort }}
+      when: not (skip_accept | default(false))
+
+    # ── PHASE 5b: TECHNICIAN REVIEW GATE (file-based — surfaced through chat) ──
+    - name: "[PHASE 5] Clean stale ACCEPT gate markers"
+      file:
+        path: "{{ item }}"
+        state: absent
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      loop:
+        - "{{ playbook_dir }}/../logs/gate_accept_pending.marker"
+        - "{{ playbook_dir }}/../logs/gate_accept_confirmed.marker"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Write ACCEPT gate pending marker"
+      copy:
+        content: |
+          gate=accept
+          vendor={{ _vendor_key | upper }}
+          csi={{ smpe_csi_dsn }}
+          dlib_zone={{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}
+          job={{ accept_check_job.jobs[0].job_name }} ({{ accept_check_job.jobs[0].job_id }})
+          rc={{ accept_check_job.jobs[0].ret_code.code }}
+          will_accept={{ acceptcheck_approved_list | default([]) | length }}
+          status=PENDING
+        dest: "{{ playbook_dir }}/../logs/gate_accept_pending.marker"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] ACCEPT gate — waiting for confirmation via chat"
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           ACCEPT GATE PENDING — AWAITING TECHNICIAN CONFIRMATION
+          ══════════════════════════════════════════════════════
+           Gate marker : logs/gate_accept_pending.marker
+           Approve     : echo 'yes' > logs/gate_accept_confirmed.marker
+           Abort       : echo 'no'  > logs/gate_accept_confirmed.marker
+           Timeout     : 60 minutes
+          ══════════════════════════════════════════════════════
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Wait for technician confirmation (max 60 min)"
+      wait_for:
+        path: "{{ playbook_dir }}/../logs/gate_accept_confirmed.marker"
+        timeout: 3600
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Read technician decision"
+      slurp:
+        src: "{{ playbook_dir }}/../logs/gate_accept_confirmed.marker"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _accept_gate_decision
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Clean up ACCEPT gate markers"
+      file:
+        path: "{{ item }}"
+        state: absent
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      loop:
+        - "{{ playbook_dir }}/../logs/gate_accept_pending.marker"
+        - "{{ playbook_dir }}/../logs/gate_accept_confirmed.marker"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Abort if technician did not confirm ACCEPT"
+      fail:
+        msg: >-
+          ACCEPT aborted by technician.
+          Review ACCEPT CHECK output before re-running.
+      when: not (skip_accept | default(false)) and (_accept_gate_decision.content | b64decode | trim | lower) != 'yes'
+
+    - name: "[PHASE 5] Set _accept_approved flag"
+      set_fact:
+        _accept_approved: true
+      when: not (skip_accept | default(false))
+
+    # ── PHASE 5c: ACCEPT ──────────────────────────────────────────────────────
+    - name: "[PHASE 5] Render ACCEPT JCL from template"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/smpe_accept.j2"
+        dest: "/tmp/imr_accept_{{ inventory_hostname }}.jcl"
+      delegate_to: localhost
+      vars:
+        accept_check_mode: false
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Copy ACCEPT JCL to z/OS USS"
+      ibm.ibm_zos_core.zos_copy:
+        src: "/tmp/imr_accept_{{ inventory_hostname }}.jcl"
+        dest: "/tmp/imr_accept_{{ inventory_hostname }}.jcl"
+        replace: true
+        binary: false
+        encoding:
+          from: UTF-8
+          to: IBM-1047
+      environment: "{{ environment_vars }}"
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Submit ACCEPT job"
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "/tmp/imr_accept_{{ inventory_hostname }}.jcl"
+        location: uss
+        wait_time: 10
+      environment: "{{ environment_vars }}"
+      register: _accept_submit
+      failed_when: false
+      when: not (skip_accept | default(false))
+
+    - name: "[PHASE 5] Fail if ACCEPT could not be submitted"
+      fail:
+        msg: >-
+          ACCEPT submission failed — no job_id returned.
+          Error: {{ _accept_submit.msg | default('unknown') }}
+      when: >-
+        not (skip_accept | default(false))
+        and _accept_approved | default(false)
+        and (_accept_submit.jobs is not defined
+             or _accept_submit.jobs | length == 0
+             or _accept_submit.jobs[0].job_id is not defined)
+
+    - name: "[PHASE 5] ACCEPT submitted — polling every 10s"
+      debug:
+        msg: >
+          ══ ACCEPT submitted ══
+          Job {{ _accept_submit.jobs[0].job_name }} ({{ _accept_submit.jobs[0].job_id }}) is running.
+          Polling every 10s (max 60 min)...
+      when: not (skip_accept | default(false)) and _accept_approved | default(false)
+
+    - name: "[PHASE 5] Poll ACCEPT job until complete"
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _accept_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _accept_poll
+      failed_when: false
+      until: >
+        _accept_poll.jobs is defined
+        and _accept_poll.jobs | length > 0
+        and ((_accept_poll.jobs[0].ret_code.code | default(none) is not none
+              and _accept_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+             or _accept_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+      retries: 360
+      delay: 10
+      when: not (skip_accept | default(false)) and _accept_approved | default(false)
+
+    - name: "[PHASE 5] Capture ACCEPT RC from poll result"
+      set_fact:
+        accept_rc: >-
+          {{ _accept_poll.jobs[0].ret_code.code | int
+             if (_accept_poll.jobs[0].ret_code is defined
+                 and _accept_poll.jobs[0].ret_code.code is not none
+                 and _accept_poll.jobs[0].ret_code.code | string != 'None')
+             else ((_accept_poll.jobs[0].ret_code.msg | default('CC 0000'))
+                   | regex_replace('^CC\s+0*(\d+).*', '\1') | default('0')) | int }}
+      when: not (skip_accept | default(false)) and _accept_approved | default(false)
+
+    - name: "[PHASE 5] Fetch ACCEPT full output"
+      ibm.ibm_zos_core.zos_job_output:
+        job_id: "{{ _accept_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: accept_job
+      when: not (skip_accept | default(false)) and _accept_approved | default(false)
+
+    - name: "[PHASE 5] Guard — fail if ACCEPT job still active after output fetch"
+      fail:
+        msg: >-
+          ACCEPT job {{ accept_job.jobs[0].job_id }} reports status
+          '{{ accept_job.jobs[0].status | default('unknown') }}' — job still running.
+      when: not (skip_accept | default(false)) and accept_job is defined and accept_job.jobs[0].status | default('') | upper in ['AC', 'ACTIVE']
+
+    - name: "[PHASE 5] ACCEPT result"
+      debug:
+        msg: >-
+          Job {{ accept_job.jobs[0].job_name }}
+          ({{ accept_job.jobs[0].job_id }})
+          RC={{ accept_rc | default('N/A') }}
+      when: not (skip_accept | default(false)) and _accept_approved | default(false) and accept_job is defined
+
+    - name: "[PHASE 5] Fail if ACCEPT RC > 4"
+      fail:
+        msg: >-
+          ACCEPT FAILED — {{ accept_job.jobs[0].job_name }}
+          RC={{ accept_rc | default('?') }}.
+          Do NOT re-run. Check SMPOUT/SMPMSG and engage rollback-planner.
+      when: not (skip_accept | default(false)) and _accept_approved | default(false) and accept_job is defined and accept_rc | default(0) | int > 4
+
+    - name: "[PHASE 5] Extract ACCEPT SMPRPT"
+      set_fact:
+        accept_smprpt: "{{ accept_job.jobs[0].ddnames
+          | selectattr('ddname', 'equalto', 'SMPRPT')
+          | map(attribute='content')
+          | list | first | default([]) }}"
+      when: not (skip_accept | default(false)) and _accept_approved | default(false) and accept_job is defined and accept_job.jobs[0].ddnames is defined
+
+    - name: "[PHASE 5] Parse accepted SYSMOD list from SMPRPT"
+      set_fact:
+        accepted_sysmod_list: >-
+          {{ (accept_smprpt if (accept_smprpt is not string) else accept_smprpt.split('\n'))
+             | select('match', '\s+\S+\s+ACCEPTED\s+PTF')
+             | map('regex_replace', '^\s+(\S+)\s+.*$', '\1')
+             | list | unique | sort }}
+      when: accept_smprpt is defined
+
+    - name: "[PHASE 5] ACCEPT CHECK vs ACCEPT comparison"
+      debug:
+        msg: |-
+          ══════════════════════════════════════════════════════
+           ACCEPT COMPLETE — ACCEPT CHECK vs ACCEPT Comparison
+          ══════════════════════════════════════════════════════
+           ACCEPT CHECK approved : {{ acceptcheck_approved_list | default([]) | length }} SYSMODs{{ '  (' + accept_check_job.jobs[0].job_name + ' ' + accept_check_job.jobs[0].job_id + ')' if (accept_check_job is defined and accept_check_job.jobs is defined) else '' }}
+           Actually ACCEPTED     : {{ accepted_sysmod_list | default([]) | length }} SYSMODs  ({{ accept_job.jobs[0].job_name }} {{ accept_job.jobs[0].job_id }} RC={{ accept_rc | default('?') }})
+           Delta (not accepted)  : {{ acceptcheck_approved_list | default([]) | difference(accepted_sysmod_list | default([])) | length }} SYSMODs
+          ══════════════════════════════════════════════════════
+      when: not (skip_accept | default(false)) and accept_job is defined and _accept_approved | default(false)
+
+    - name: "[PHASE 5] Save ACCEPT audit log"
+      copy:
+        content: "{{ accept_job | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../logs/internet_accept_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      ignore_errors: true
+      when: not (skip_accept | default(false)) and _accept_approved | default(false) and accept_job is defined
+
+    - name: "[PHASE 5] Write ACCEPT cycle marker (maintenance cycle complete)"
+      shell: |
+        cat > "{{ playbook_dir }}/../logs/cycle_{{ _vendor_key }}_{{ _csi_key }}_accept.marker" << 'MARKER'
+        vendor={{ _vendor_key }}
+        csi={{ smpe_csi_dsn }}
+        zone={{ smpe_dlib_zone }}
+        job={{ accept_job.jobs[0].job_id }}
+        rc={{ accept_rc | default('0') }}
+        accepted={{ accepted_sysmod_list | default([]) | join(' ') }}
+        timestamp={{ now().strftime('%Y-%m-%dT%H:%M:%S') }}
+        result=MAINTENANCE_CYCLE_COMPLETE
+        MARKER
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      ignore_errors: true
+      when: not (skip_accept | default(false)) and accept_job is defined and accept_rc | default(0) | int <= 4 and not (smpe_test_mode | default(false) | bool)
+
+    - name: "[PHASE 5] Save ACCEPT phase report"
+      copy:
+        content: |-
+          # Phase 5 — ACCEPT Report
+
+          Generated    : {{ now(fmt='%Y-%m-%d %H:%M:%S') }}
+          Vendor       : {{ _vendor_key | upper }}
+          SMPCSI       : {{ smpe_csi_dsn }}
+          Dlib zone    : {{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}
+          Job          : {{ accept_job.jobs[0].job_name }} ({{ accept_job.jobs[0].job_id }}) RC={{ accept_rc | default('?') }}
+          ACCEPT CHECK : {{ acceptcheck_approved_list | default([]) | length }} SYSMODs approved
+          Accepted     : {{ accepted_sysmod_list | default([]) | length }} SYSMODs
+
+          ## Accepted SYSMODs — {{ accepted_sysmod_list | default([]) | length }}
+
+          {{ accepted_sysmod_list | default([]) | join('\n          ') }}
+        dest: "{{ playbook_dir }}/../logs/phase5_accept_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      register: _phase5c_report
+      ignore_errors: true
+      when: not (skip_accept | default(false)) and _accept_approved | default(false) and accept_job is defined and not (smpe_test_mode | default(false) | bool)
+
+    - name: "[PHASE 5] ACCEPT phase report saved"
+      debug:
+        msg: "Phase 5 ACCEPT report saved → {{ _phase5c_report.dest | default('(not saved)') }}"
+      when: not (skip_accept | default(false)) and _accept_approved | default(false)
+
+    - name: "[PHASE 5] Generate final 3-column maintenance report"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/maintenance_report.j2"
+        dest: "{{ playbook_dir }}/../logs/maintenance_report_{{ _vendor_key }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.md"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      ignore_errors: true
+      when: not (smpe_test_mode | default(false) | bool)
+
+    - name: "[PHASE 5] Final maintenance summary"
+      debug:
+        msg: |-
+          ══════════════════════════════════════════════════════
+           INTERNET MAINTENANCE COMPLETE
+          ══════════════════════════════════════════════════════
+           Vendor      : {{ _vendor_key | upper }}
+           SMPCSI      : {{ smpe_csi_dsn }}
+           Target zone : {{ smpe_target_zone }}
+           Dlib zone   : {{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}
+           RECEIVE RC  : {{ receive_job.jobs[0].ret_code.code if (receive_job is defined and receive_job.jobs is defined) else 'N/A (skipped)' }}
+           APPLYCK RC  : {{ apply_check_job.jobs[0].ret_code.code if (apply_check_job is defined and apply_check_job.jobs is defined) else 'N/A (skipped)' }}
+           APPLY RC    : {{ apply_job.jobs[0].ret_code.code if (apply_job is defined and apply_job.jobs is defined) else 'N/A (skipped)' }}
+           ACCEPT RC   : {{ accept_job.jobs[0].ret_code.code if (accept_job is defined and accept_job.jobs is defined) else (accept_job_rc | default('N/A (skipped)')) }}
+          ──────────────────────────────────────────────────────
+           Received    : {{ received_sysmod_list | default([]) | length }} SYSMODs
+           Applied     : {{ applied_sysmod_list  | default([]) | length }} SYSMODs
+           Accepted    : {{ accepted_sysmod_list | default([]) | length }} SYSMODs
+          ──────────────────────────────────────────────────────
+           Report : logs/maintenance_report_{{ _vendor_key }}_*.md
+           Logs   : logs/internet_*_{{ _vendor_key }}_*.json
+          ══════════════════════════════════════════════════════

@@ -1,0 +1,35 @@
+//{{ _vendor_jobpfx }}APL   JOB  ({{ smpe_job_acct | default('') }}),'SMP/E APPLY',
+//             CLASS={{ smpe_job_class | default('A') }},
+//             MSGCLASS={{ smpe_job_msgclass | default('X') }},
+//             NOTIFY=&SYSUID,MSGLEVEL=(1,1)
+//*-----------------------------------------------------------------
+//* SMP/E APPLY  -  install SYSMODs into TARGET zone
+//* Generated : {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host      : {{ inventory_hostname }}
+//* CSI       : {{ smpe_csi_dsn | default(smpe_global_csi) }}
+//* Zone      : {{ smpe_target_zone }}
+//*
+//* WARNING: Run APPLY CHECK first and verify HOLDDATA before proceeding.
+//*-----------------------------------------------------------------
+//STEP001  EXEC PGM=GIMSMP,REGION=0M,PARM='PROCESS=WAIT'
+//SMPCSI   DD  DISP=SHR,DSN={{ smpe_csi_dsn | default(smpe_global_csi) }}
+//SMPJHOME DD  PATHDISP=KEEP,
+//             PATH='{{ smpe_javahome }}'
+//SMPOUT   DD  SYSOUT=*
+//SMPRPT   DD  SYSOUT=*
+//SMPLIST  DD  SYSOUT=*
+//SMPLOG   DD  SYSOUT=*
+//SYSPRINT DD  SYSOUT=*
+//SMPCNTL  DD  *
+  SET BDY({{ smpe_target_zone }}).
+  APPLY
+{% if smpe_sysmods is defined and smpe_sysmods | length > 0 %}
+    SYSMODS(
+{% for sysmod in smpe_sysmods %}
+      {{ sysmod }}
+{% endfor %}
+    )
+{% endif %}
+    BYPASS({{ smpe_bypass_holds | default('HOLDSYS') }})
+    GEXT.
+/*

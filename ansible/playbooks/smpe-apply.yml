@@ -1,0 +1,82 @@
+---
+# Ansible Playbook: SMP/E APPLY
+# This playbook automates the SMP/E APPLY process for z/OS software deployment
+
+- name: SMP/E APPLY Deployment
+  hosts: "{{ target_lpar | default('localhost') }}"
+  gather_facts: false
+  
+  vars:
+    zone_name: "{{ zone | default('MVST100') }}"
+    package_id: "{{ package | default('') }}"
+    check_only: "{{ check | default(false) }}"
+    bypass_holds: "{{ bypass | default('HOLDERROR,HOLDCLASS(DOC,FIXCAT)') }}"
+    sysmod_list: "{{ sysmods | default('') }}"
+    
+  tasks:
+    - name: Validate required variables
+      assert:
+        that:
+          - zone_name is defined
+          - zone_name | length > 0
+        fail_msg: "zone_name is required"
+        
+    - name: Set JCL template based on operation
+      set_fact:
+        jcl_template: "{{ 'smpe_apply_check.j2' if check_only else 'smpe_apply.j2' }}"
+        operation_name: "{{ 'APPLY CHECK' if check_only else 'APPLY' }}"
+        
+    - name: Display deployment information
+      debug:
+        msg: |
+          SMP/E {{ operation_name }} Operation
+          Zone: {{ zone_name }}
+          Package: {{ package_id }}
+          Bypass: {{ bypass_holds }}
+          
+    - name: Submit SMP/E {{ operation_name }} job
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "templates/{{ jcl_template }}"
+        location: LOCAL
+        wait: yes
+        wait_time_s: 3600
+        max_rc: 4
+      register: apply_job
+      
+    - name: Check job completion status
+      debug:
+        msg: "Job {{ apply_job.jobs[0].job_name }} completed with RC={{ apply_job.jobs[0].ret_code.code }}"
+        
+    - name: Fail if job RC > 4
+      fail:
+        msg: "SMP/E {{ operation_name }} failed with RC={{ apply_job.jobs[0].ret_code.code }}"
+      when: apply_job.jobs[0].ret_code.code | int > 4
+      
+    - name: Extract SMPOUT content
+      set_fact:
+        smpout_content: "{{ apply_job.jobs[0].ddnames | selectattr('ddname', 'equalto', 'SMPOUT') | map(attribute='content') | list | first }}"
+      when: apply_job.jobs[0].ddnames is defined
+      
+    - name: Display SMPOUT summary
+      debug:
+        msg: "{{ smpout_content | regex_findall('GIM.*') }}"
+      when: smpout_content is defined
+      
+    - name: Save job output to file
+      copy:
+        content: "{{ apply_job | to_nice_json }}"
+        dest: "/tmp/smpe_apply_{{ zone_name }}_{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      
+    - name: Post-APPLY - Refresh LLA (if not check mode)
+      ibm.ibm_zos_core.zos_operator:
+        cmd: "F LLA,REFRESH"
+      when: 
+        - not check_only
+        - apply_job.jobs[0].ret_code.code == 0
+      ignore_errors: yes
+      
+    - name: Display success message
+      debug:
+        msg: "✅ SMP/E {{ operation_name }} completed successfully for zone {{ zone_name }}"
+      when: apply_job.jobs[0].ret_code.code == 0

@@ -1,0 +1,16 @@
+﻿{
+    "source":  "z/OSMF REST API — MISFXCT JOB04938",
+    "smpe_level":  "37.41",
+    "run_time":  "00:40:29",
+    "fixcat_filter":  "IBM*.*",
+    "missing_fixes":  [
+
+                      ],
+    "summary":  "***NONE — No missing critical IBM fixcat SYSMODs in zone TZONE",
+    "swi":  "TDMF_ZOSMFA_V5R11M0",
+    "globalcsi":  "ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI",
+    "highest_rc":  0,
+    "run_date":  "2026-11-03",
+    "retrieved":  "2026-11-22T11:05:10Z",
+    "targetzone":  "TZONE"
+}

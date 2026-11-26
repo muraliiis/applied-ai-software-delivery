@@ -1,0 +1,37 @@
+---
+# host_vars/prod1.yml
+# Host-specific variables for LPAR: PROD1 (production)
+#
+# SECURITY: Credentials must be stored in Ansible Vault.
+# Encrypt secrets with: ansible-vault encrypt_string '<value>' --name '<var>'
+
+# ─────────────────────────────────────────────
+# SSH Connection
+# ─────────────────────────────────────────────
+ansible_host: 138.69.218.201
+ansible_user: syssa69
+ansible_password: "{{ vault_prod1_password }}"
+
+# ─────────────────────────────────────────────
+# LPAR Identity
+# ─────────────────────────────────────────────
+lpar_name: PROD1
+sysplex_name: PLEX1
+
+# ─────────────────────────────────────────────
+# SMP/E Zone Overrides (if PROD1 differs from group default)
+# ─────────────────────────────────────────────
+smpe_target_zone: MVST100
+smpe_dlib_zone: MVST100D
+
+# ─────────────────────────────────────────────
+# Python path override (if different Python release installed)
+# For Python 3.10, change v3r9 → v3r10
+# ─────────────────────────────────────────────
+# ansible_python_interpreter: /usr/lpp/IBM/cyp/v3r10/pyz/bin/python3
+
+# ─────────────────────────────────────────────
+# z/OSMF Software Management — per-LPAR system nickname
+# Used by ibm_zosmf zmf_swmgmt_* modules
+# ─────────────────────────────────────────────
+zmf_system_nickname: PROD1

@@ -1,0 +1,276 @@
+---
+# Playbook : copyrena-restore.yml
+# Purpose  : ADRDSSU CLEANUP (delete old-qualifier datasets) + RESTDSN (restore from
+#            shrinkwrap under new qualifier). Equivalent to Steps 1-5 of the
+#            sdt-maintenance-refresh-agent pipeline.
+#
+# Usage (interactive — vars_prompt will fire):
+#   ansible-playbook playbooks/copyrena-restore.yml
+#
+# Usage (non-interactive):
+#   ansible-playbook playbooks/copyrena-restore.yml \
+#     -e "shrinkwrap_dsn=ACSNS.TDMF.V5R11M0.ZOSMFA.ZS31D.SHRNKWRP" \
+#     -e "new_qual=ACS%S.TDMF.V5R11M0.ZOSMFB"
+#
+# Usage (live run — default is dry run):
+#   ansible-playbook playbooks/copyrena-restore.yml \
+#     -e "shrinkwrap_dsn=..." -e "new_qual=..." -e "typrun_norun=false"
+#
+# AWX Survey variables: shrinkwrap_dsn, new_qual, typrun_norun
+
+- name: ADRDSSU Cleanup and Restore (COPYRENA)
+  hosts: dcuf
+  gather_facts: false
+
+  vars_prompt:
+    - name: shrinkwrap_dsn
+      prompt: "Enter existing shrinkwrap DSN (e.g. ACSNS.TDMF.V5R11M0.ZOSMFA.ZS31D.SHRNKWRP)"
+      private: false
+
+    - name: new_qual
+      prompt: "Enter new package qualifier (e.g. ACS%S.TDMF.V5R11M0.ZOSMFB)"
+      private: false
+
+    - name: typrun_norun
+      prompt: "Dry run? (true=TYPRUN=NORUN no changes, false=live run) [true]"
+      private: false
+      default: "true"
+
+  pre_tasks:
+    - name: Ensure /tmp/zos_shell.sh wrapper is present
+      vars:
+        ansible_shell_executable: /bin/sh
+      raw: |
+        set -e
+        rm -f /tmp/zos_shell.sh
+        echo '#!/bin/sh'                                                                     > /tmp/zos_shell.sh
+        echo 'export _BPXK_AUTOCVT=ON'                                                     >> /tmp/zos_shell.sh
+        echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3'                                     >> /tmp/zos_shell.sh
+        echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+        echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+        echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13'                           >> /tmp/zos_shell.sh
+        echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"'                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_ERR=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_IN=txt'                                                    >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_OUT=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export LANG=C'                                                                >> /tmp/zos_shell.sh
+        echo 'for f in "${HOME}/.ansible/tmp/"*/AnsiballZ_*; do'                           >> /tmp/zos_shell.sh
+        echo '  [ -f "$f" ] && chtag -tc ISO8859-1 "$f" 2>/dev/null || true'              >> /tmp/zos_shell.sh
+        echo 'done'                                                                         >> /tmp/zos_shell.sh
+        echo 'exec /bin/sh "$@"'                                                           >> /tmp/zos_shell.sh
+        chmod +x /tmp/zos_shell.sh
+      changed_when: false
+
+    - name: Ensure logs directory exists on control node
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../logs"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+  tasks:
+    # ── 1. Validate inputs ────────────────────────────────────────────────
+    - name: Validate inputs
+      assert:
+        that:
+          - shrinkwrap_dsn is defined and shrinkwrap_dsn | length > 0
+          - new_qual is defined and new_qual | length > 0
+          - shrinkwrap_dsn.split('.') | length >= 4
+        fail_msg: >-
+          shrinkwrap_dsn and new_qual are required.
+          shrinkwrap_dsn must have at least 4 qualifiers.
+
+    # ── 2. Derive substitution values ─────────────────────────────────────
+    # shrinkwrap_dsn = ACSNS.TDMF.V5R11M0.ZOSMFA.ZS31D.SHRNKWRP
+    #   → strip last 2 qualifiers → ACSNS.TDMF.V5R11M0.ZOSMFA
+    #   → normalise first qualifier to ACS%S → ACS%S.TDMF.V5R11M0.ZOSMFA
+    - name: Derive EXISTING_QUAL from shrinkwrap DSN
+      set_fact:
+        _dsn_parts:          "{{ shrinkwrap_dsn.split('.') }}"
+
+    - name: Derive EXISTING_QUAL_REST and NEW_QUAL_REST
+      set_fact:
+        _existing_qual_rest: "{{ _dsn_parts[1:-2] | join('.') }}"
+        _new_qual_rest:      "{{ new_qual.split('.')[1:] | join('.') }}"
+        _existing_qual:      "{{ 'ACS%S.' + (_dsn_parts[1:-2] | join('.')) }}"
+
+    - name: Set ADRDSSU substitution variables
+      set_fact:
+        cleanup_exclude:     "{{ shrinkwrap_dsn }}"
+        cleanup_include_old: "{{ _existing_qual }}.**"
+        cleanup_include_new: "{{ new_qual }}.**"
+        tape2_dsn:           "{{ shrinkwrap_dsn }}"
+        restore_include:     "{{ _existing_qual }}.**"
+        rename_acsns_old:    "ACSNS.{{ _existing_qual_rest }}.**"
+        rename_acsns_new:    "ACSNS.{{ _new_qual_rest }}.**"
+        rename_acsvs_old:    "ACSVS.{{ _existing_qual_rest }}.**"
+        rename_acsvs_new:    "ACSVS.{{ _new_qual_rest }}.**"
+
+    # ── 3. Display run parameters ──────────────────────────────────────────
+    - name: Display run parameters
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           ADRDSSU Cleanup + Restore (COPYRENA)
+          ══════════════════════════════════════════════════════
+           Shrinkwrap DSN   : {{ shrinkwrap_dsn }}
+           Existing qual    : {{ _existing_qual }}
+           New qual         : {{ new_qual }}
+           CLEANUP EXCLUDE  : {{ cleanup_exclude }}
+           CLEANUP INCLUDE  : {{ cleanup_include_old }}
+                              {{ cleanup_include_new }}
+           RESTORE INCLUDE  : {{ restore_include }}
+           RENAME ACSNS     : {{ rename_acsns_old }} → {{ rename_acsns_new }}
+           RENAME ACSVS     : {{ rename_acsvs_old }} → {{ rename_acsvs_new }}
+           Mode             : {{ 'DRY RUN (TYPRUN=NORUN)' if (typrun_norun | bool) else 'LIVE RUN' }}
+          ══════════════════════════════════════════════════════
+
+    # ── 4. Generate and submit JCL ─────────────────────────────────────────
+    - name: Render COPYRENA JCL from template
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/copyrena.j2"
+        dest: "/tmp/copyrena_{{ inventory_hostname }}.jcl"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+    - name: Copy COPYRENA JCL to z/OS USS
+      ibm.ibm_zos_core.zos_copy:
+        src: "/tmp/copyrena_{{ inventory_hostname }}.jcl"
+        dest: "/tmp/copyrena_{{ inventory_hostname }}.jcl"
+        replace: true
+        binary: false
+        encoding:
+          from: UTF-8
+          to: IBM-1047
+      environment: "{{ environment_vars }}"
+
+    - name: Submit COPYRENA job
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "/tmp/copyrena_{{ inventory_hostname }}.jcl"
+        location: uss
+        wait_time: 3600
+      environment: "{{ environment_vars }}"
+      register: _copyrena_submit
+      failed_when: false
+
+    - name: Fail if COPYRENA job could not be submitted
+      fail:
+        msg: >-
+          COPYRENA submission failed — no job_id returned.
+          Check JCL syntax and USS path.
+          Error: {{ _copyrena_submit.msg | default('unknown') }}
+      when: >-
+        _copyrena_submit.jobs is not defined
+        or _copyrena_submit.jobs | length == 0
+        or _copyrena_submit.jobs[0].job_id is not defined
+
+    # ── 5. Monitor job ─────────────────────────────────────────────────────
+    - name: Poll COPYRENA job until complete
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _copyrena_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _copyrena_poll
+      failed_when: false
+      until: >
+        _copyrena_poll.jobs is defined
+        and _copyrena_poll.jobs | length > 0
+        and ((_copyrena_poll.jobs[0].ret_code.code | default(none) is not none
+              and _copyrena_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+             or _copyrena_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+      retries: 360
+      delay: 10
+
+    - name: Re-verify COPYRENA job is not active
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _copyrena_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _copyrena_reverify
+
+    - name: Fail if COPYRENA job still active after poll
+      fail:
+        msg: >-
+          COPYRENA job {{ _copyrena_submit.jobs[0].job_id }} is still active
+          (status={{ _copyrena_reverify.jobs[0].status | default('unknown') }}).
+          Poll false-positive — increase delay or re-run.
+      when: >-
+        _copyrena_reverify.jobs is defined
+        and _copyrena_reverify.jobs | length > 0
+        and _copyrena_reverify.jobs[0].status | default('') | upper in ['AC', 'ACTIVE', 'INPUT', 'HELD']
+
+    - name: Capture COPYRENA RC
+      set_fact:
+        copyrena_rc: >-
+          {{ _copyrena_poll.jobs[0].ret_code.code | int
+             if (_copyrena_poll.jobs[0].ret_code is defined
+                 and _copyrena_poll.jobs[0].ret_code.code is not none
+                 and _copyrena_poll.jobs[0].ret_code.code | string != 'None')
+             else ((_copyrena_poll.jobs[0].ret_code.msg | default('CC 0000'))
+                   | regex_replace('^CC\s+0*(\d+).*', '\1') | default('0')) | int }}
+
+    # ── 6. Retrieve output ─────────────────────────────────────────────────
+    - name: Fetch COPYRENA full output
+      ibm.ibm_zos_core.zos_job_output:
+        job_id: "{{ _copyrena_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: copyrena_job
+
+    - name: Display COPYRENA result
+      debug:
+        msg: >-
+          Job {{ copyrena_job.jobs[0].job_name }}
+          ({{ copyrena_job.jobs[0].job_id }})
+          RC={{ copyrena_rc }}
+
+    - name: Fail if COPYRENA RC > 4
+      fail:
+        msg: >-
+          COPYRENA FAILED — RC={{ copyrena_rc }}.
+          Review SYSPRINT for job {{ copyrena_job.jobs[0].job_id }}.
+      when: copyrena_rc | int > 4
+
+    - name: Extract and display ADR messages from SYSPRINT
+      set_fact:
+        _copyrena_sysprint: "{{ copyrena_job.jobs[0].ddnames
+          | selectattr('ddname', 'equalto', 'SYSPRINT')
+          | map(attribute='content')
+          | list | first | default('') }}"
+      when: copyrena_job.jobs[0].ddnames is defined
+
+    - name: Display ADR dataset counts and key messages
+      debug:
+        msg: "{{ ((_copyrena_sysprint is string) | ternary(_copyrena_sysprint, _copyrena_sysprint | join('\n'))) | regex_findall('ADR[0-9]+[A-Z]\\s.+') }}"
+      when: _copyrena_sysprint is defined and _copyrena_sysprint | length > 0
+
+    # ── 7. Audit log ───────────────────────────────────────────────────────
+    - name: Save COPYRENA audit log
+      copy:
+        content: "{{ copyrena_job | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../logs/copyrena_{{ _new_qual_rest | replace('.', '_') }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      ignore_errors: true
+
+    # ── 8. Completion summary ──────────────────────────────────────────────
+    - name: Display completion summary
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           COPYRENA COMPLETE
+          ══════════════════════════════════════════════════════
+           Job       : {{ copyrena_job.jobs[0].job_name }} ({{ copyrena_job.jobs[0].job_id }})
+           RC        : {{ copyrena_rc }}
+           Mode      : {{ 'DRY RUN (TYPRUN=NORUN)' if (typrun_norun | bool) else 'LIVE RUN' }}
+           Old qual  : {{ _existing_qual }}
+           New qual  : {{ new_qual }}
+          ══════════════════════════════════════════════════════
+          {% if typrun_norun | bool %}
+           NOTE: This was a dry run. No datasets were deleted or restored.
+                 Re-run with -e "typrun_norun=false" to execute live.
+          {% endif %}

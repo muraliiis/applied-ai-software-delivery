@@ -1,0 +1,58 @@
+//BCMRCV   JOB  ({{ smpe_job_acct | default('') }}),'BCOM SMPE ORDR',
+//             CLASS={{ smpe_job_class | default('S') }},
+//             MSGCLASS={{ smpe_job_msgclass | default('X') }},
+//             NOTIFY=&SYSUID,MSGLEVEL=(1,1)
+//*
+//* JOB  : ACSNS.CA.SAMPLE.JCLS(BCOMORDR)
+//* DESC : SMP/E RECEIVE ORDER - Broadcom internet delivery via GIMSMP/HTTPS
+//* DATE : {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* HOST : {{ inventory_hostname }}
+//* CSI  : {{ smpe_csi_dsn }}
+//* NTS  : {{ smpe_nts_path }}  (staging directory, not a credentials file)
+//* ZONE : {{ smpe_global_zone }}
+//*
+//SMPER1  EXEC PGM=GIMSMP,REGION=0M,
+//             PARM='PROCESS=WAIT',DYNAMNBR=120
+//SMPCSI   DD  DISP=SHR,DSN={{ smpe_csi_dsn }}
+//SMPNTS   DD  PATHDISP=KEEP,
+//             PATH='{{ smpe_nts_path }}'
+//SMPOUT   DD  SYSOUT=*
+//SMPRPT   DD  SYSOUT=*
+//SMPLIST  DD  SYSOUT=*
+//SMPLOG   DD  SYSOUT=*
+//SYSPRINT DD  SYSOUT=*
+//SMPJHOME DD  PATHDISP=KEEP,
+//             PATH='{{ smpe_javahome_broadcom | default(smpe_javahome) }}'
+//SYSUT1   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SYSUT2   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SYSUT3   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SYSUT4   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SMPCNTL  DD  *
+  SET BDY({{ smpe_global_zone }}).
+  RECEIVE ORDER(ORDERSERVER(ORDSRVR)
+{% if smpe_broadcom_target_zones is defined and smpe_broadcom_target_zones | length > 0 %}
+          FORTGTZONES({{ smpe_broadcom_target_zones }})
+{% endif %}
+          CLIENT(MYCLIENT)
+          CONTENT(ALL)
+          WAIT(30))
+          .
+/*
+//ORDSRVR  DD  *
+  <ORDERSERVER
+  inventory="all"
+  url="{{ smpe_broadcom_orderserver_url | default('https://eapi.broadcom.com/receiveorder') }}"
+  keyring="{{ smpe_broadcom_keyring | default('FTPACS/BCOMSMPE_KEYRING') }}"
+  certificate="{{ smpe_broadcom_certificate | default('BCOM SMPE Client Certificate') }}">
+  </ORDERSERVER>
+/*
+//MYCLIENT DD  *
+  <CLIENT
+  signaturekeyring="{{ smpe_broadcom_keyring | default('FTPACS/BCOMSMPE_KEYRING') }}"
+  downloadmethod="https"
+  javahome="{{ smpe_javahome_broadcom | default(smpe_javahome) }}"
+  classpath="{{ smpe_classpath }}"
+  javadebugoptions="-Dcom.ibm.smp.debug=severe -showversion"
+  downloadkeyring="javatruststore">
+  </CLIENT>
+/*

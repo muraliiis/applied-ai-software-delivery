@@ -1,0 +1,38 @@
+//DDEFUPDT JOB ({{ smpe_job_acct | default('') }}),'SDT',CLASS={{ smpe_job_class | default('S') }},NOTIFY=&SYSUID,
+//        MSGCLASS={{ smpe_job_msgclass | default('X') }},REGION=0M
+//*
+//* SMP/E DDDEF Update — generated {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host      : {{ inventory_hostname }}
+//* Global CSI: {{ global_csi }}
+//* SMPPTS    : {{ smppts_dsn }}
+//* Old DDDEF : {{ dddef_change_old }}
+//* New DDDEF : {{ dddef_change_new }}
+//*
+//GBLZONE  EXEC PGM=GIMSMP,REGION=0M,
+//         PARM='CSI={{ global_csi }}'
+//SMPPTS   DD   DSN={{ smppts_dsn }},DISP=SHR
+//SMPLOG   DD   SYSOUT=*
+//SMPLOGA  DD   SYSOUT=*
+//SMPCNTL  DD   *
+  SET BDY(GLOBAL) .
+  UCLIN .
+ REP GLOBALZONE
+   ZINDEX(({{ dlib_zone }},{{ dlib_csi }},DLIB)
+          ({{ target_zone }},{{ target_csi }},TARGET)).
+ ENDUCL .
+ SET BDY(GLOBAL) .
+ ZONEEDIT DDDEF.
+ CHANGE DATASET({{ dddef_change_old }},
+                {{ dddef_change_new }}).
+ ENDZONEEDIT.
+ SET BDY({{ dlib_zone }}) .
+ ZONEEDIT DDDEF.
+ CHANGE DATASET({{ dddef_change_old }},
+                {{ dddef_change_new }}).
+ ENDZONEEDIT.
+ SET BDY({{ target_zone }}) .
+ ZONEEDIT DDDEF.
+ CHANGE DATASET({{ dddef_change_old }},
+                {{ dddef_change_new }}).
+ ENDZONEEDIT.
+/*

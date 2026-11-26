@@ -1,0 +1,22 @@
+---
+# group_vars/development.yml
+# Overrides for the DEVELOPMENT environment
+
+# ─────────────────────────────────────────────
+# z/OSMF Host (development)
+# ─────────────────────────────────────────────
+zmf_host: "138.69.218.201"
+
+# ─────────────────────────────────────────────
+# SMP/E Development Zone Config
+# ─────────────────────────────────────────────
+smpe_csi_hlq: "SMPE.DEV"
+smpe_global_zone: "GLOBAL"
+
+change_management_required: false
+peer_review_required: false
+
+# Development is most permissive — allows bypassing HIPER and FIXCAT holds
+smpe_bypass_holds: "HOLDERROR,HOLDCLASS(DOC,FIXCAT,HIPER,USMOD)"
+
+rollback_on_failure: false

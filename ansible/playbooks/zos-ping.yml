@@ -1,0 +1,50 @@
+---
+# playbooks/zos-ping.yml
+# Connectivity test for ibm_zos_core v1.6.0
+#
+# Usage:
+#   ansible-playbook playbooks/zos-ping.yml -i inventory/hosts.yml --ask-pass
+#   ansible-playbook playbooks/zos-ping.yml -i inventory/hosts.yml --ask-pass -l dev1
+
+- name: z/OS Connectivity Test
+  hosts: "{{ target | default('dev1') }}"
+  gather_facts: false
+
+  pre_tasks:
+    # Recreate /tmp/zos_shell.sh if this playbook is run directly (not via site.yml).
+    # Uses /bin/sh directly in case the wrapper was lost after an LPAR IPL.
+    - name: Ensure z/OS environment wrapper exists (/tmp/zos_shell.sh)
+      raw: |
+        echo '#!/bin/sh' > /tmp/zos_shell.sh
+        echo 'export _BPXK_AUTOCVT=ON' >> /tmp/zos_shell.sh
+        echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3' >> /tmp/zos_shell.sh
+        echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13' >> /tmp/zos_shell.sh
+        echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+        echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+        echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"' >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_ERR=txt' >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_IN=txt' >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_OUT=txt' >> /tmp/zos_shell.sh
+        echo 'export LANG=C' >> /tmp/zos_shell.sh
+        echo 'if [ "$1" = "-c" ] && [ -n "$2" ]; then' >> /tmp/zos_shell.sh
+        echo '  for word in $2; do' >> /tmp/zos_shell.sh
+        echo '    case "$word" in' >> /tmp/zos_shell.sh
+        echo '      *.rexx) if [ -f "$word" ]; then chtag -tc ISO8859-1 "$word" 2>/dev/null; fi;;' >> /tmp/zos_shell.sh
+        echo '    esac' >> /tmp/zos_shell.sh
+        echo '  done' >> /tmp/zos_shell.sh
+        echo 'fi' >> /tmp/zos_shell.sh
+        echo 'exec /bin/sh "$@"' >> /tmp/zos_shell.sh
+        chmod +x /tmp/zos_shell.sh
+      vars:
+        ansible_shell_executable: /bin/sh
+      changed_when: false
+
+  tasks:
+    - name: Ping z/OS managed node
+      ibm.ibm_zos_core.zos_ping:
+      register: ping_result
+      environment: "{{ environment_vars }}"
+
+    - name: Display ping result
+      debug:
+        msg: "{{ inventory_hostname }} ({{ ansible_host }}) — {{ ping_result.ping }}"

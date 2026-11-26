@@ -1,0 +1,121 @@
+---
+# Playbook : smpe-receive.yml
+# Purpose  : SMP/E RECEIVE ORDER — internet retrieval via GIMZIP
+#
+# Usage:
+#   ansible-playbook playbooks/smpe-receive.yml \
+#     -l dev1 \
+#     -e "smpe_sysmods=['UA12345','UA12346']" \
+#     -e "smpe_csi_dsn=SMPE.ZS24M27.R2006.GLOBAL.CSI" \
+#     -e "smpe_nts_dsn=SMPE.ZS24M27.SMPNTS"
+#
+# Prerequisites on the managed z/OS node:
+#   - GIMZIP configured with valid IBM ESO credentials (SMPNTS dataset)
+#   - Outbound HTTPS (port 443) to esw.ibm.com
+#   - SYS1.MIGLIB contains GIMZIP load module
+#   - SMPPTS (SMP/E portable package toolbox) has adequate space
+#
+# After successful RECEIVE, run smpe-apply.yml (with check: true first).
+
+- name: SMP/E RECEIVE ORDER — Internet Retrieval
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+
+  pre_tasks:
+    # Safety net: recreate wrapper if node was recycled since last setup run
+    - name: Ensure /tmp/zos_shell.sh wrapper is present
+      vars:
+        ansible_shell_executable: /bin/sh
+      raw: |
+        set -e
+        if [ ! -x /tmp/zos_shell.sh ]; then
+          echo '#!/bin/sh'                                                                     > /tmp/zos_shell.sh
+          echo 'export _BPXK_AUTOCVT=ON'                                                     >> /tmp/zos_shell.sh
+          echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3'                                     >> /tmp/zos_shell.sh
+          echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+          echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+          echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13'                           >> /tmp/zos_shell.sh
+          echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"'                   >> /tmp/zos_shell.sh
+          echo 'export _TAG_REDIR_ERR=txt'                                                   >> /tmp/zos_shell.sh
+          echo 'export _TAG_REDIR_IN=txt'                                                    >> /tmp/zos_shell.sh
+          echo 'export _TAG_REDIR_OUT=txt'                                                   >> /tmp/zos_shell.sh
+          echo 'export LANG=C'                                                                >> /tmp/zos_shell.sh
+          echo 'for f in /tmp/AnsiballZ_*.rexx; do'                                          >> /tmp/zos_shell.sh
+          echo '  [ -f "$f" ] && chtag -tc ISO8859-1 "$f" 2>/dev/null || true'              >> /tmp/zos_shell.sh
+          echo 'done'                                                                         >> /tmp/zos_shell.sh
+          echo 'exec /bin/sh "$@"'                                                           >> /tmp/zos_shell.sh
+          chmod +x /tmp/zos_shell.sh
+        fi
+      changed_when: false
+
+  tasks:
+    - name: Validate required variables
+      assert:
+        that:
+          - smpe_sysmods is defined
+          - smpe_sysmods | length > 0
+          - smpe_csi_dsn is defined
+          - smpe_nts_dsn is defined
+        fail_msg: >-
+          smpe_sysmods, smpe_csi_dsn, and smpe_nts_dsn are all required.
+          Example: -e "smpe_sysmods=['UA12345']" \
+                   -e "smpe_csi_dsn=SMPE.ZS24M27.R2006.GLOBAL.CSI" \
+                   -e "smpe_nts_dsn=SMPE.ZS24M27.SMPNTS"
+
+    - name: Display RECEIVE ORDER parameters
+      debug:
+        msg: |
+          ── SMP/E RECEIVE ORDER (RSUORDER / GIMZIP) ───────────
+          SMPCSI      : {{ smpe_csi_dsn }}
+          SMPNTS      : {{ smpe_nts_dsn }}
+          Global zone : {{ smpe_global_zone }}
+          SYSMODs     : {{ smpe_sysmods | join(' ') }}
+          ──────────────────────────────────────────────────────
+
+    - name: Submit RECEIVE ORDER job
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "templates/smpe_receive.j2"
+        location: LOCAL
+        wait: true
+        wait_time_s: "{{ job_wait_timeout }}"
+        max_rc: 4
+      environment: "{{ environment_vars }}"
+      register: receive_job
+
+    - name: Show job completion
+      debug:
+        msg: >-
+          Job {{ receive_job.jobs[0].job_name }}
+          ({{ receive_job.jobs[0].job_id }})
+          RC={{ receive_job.jobs[0].ret_code.code }}
+
+    - name: Fail if RC > 4
+      fail:
+        msg: >-
+          RECEIVE ORDER FAILED —
+          {{ receive_job.jobs[0].job_name }}
+          RC={{ receive_job.jobs[0].ret_code.code }}.
+          Check SMPOUT / SMPMSG in the job log.
+      when: receive_job.jobs[0].ret_code.code | int > 4
+
+    - name: Extract SMPOUT lines
+      set_fact:
+        smpout_lines: "{{ receive_job.jobs[0].ddnames
+          | selectattr('ddname', 'equalto', 'SMPOUT')
+          | map(attribute='content')
+          | list | first | default('') }}"
+      when: receive_job.jobs[0].ddnames is defined
+
+    - name: Show GIM messages from SMPOUT
+      debug:
+        msg: "{{ smpout_lines | regex_findall('GIM[0-9]+.*') }}"
+      when:
+        - smpout_lines is defined
+        - smpout_lines | length > 0
+
+    - name: Save job output for audit trail
+      copy:
+        content: "{{ receive_job | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../logs/smpe_receive_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+      delegate_to: localhost
+      ignore_errors: true   # logs dir may not exist; non-fatal

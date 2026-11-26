@@ -1,0 +1,23 @@
+//SHRNKWRP JOB ({{ smpe_job_acct | default('') }}),'SDT',CLASS={{ smpe_job_class | default('S') }},NOTIFY=&SYSUID,
+//        MSGCLASS={{ smpe_job_msgclass | default('X') }},REGION=0M
+//*-----------------------------------------------------------------
+//* ADRDSSU SHRINKWRAP — Backup new-qualifier datasets
+//* Generated : {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host      : {{ inventory_hostname }}
+//* Include   : {{ shrnkwrp_include }}
+//* Exclude   : {{ shrnkwrp_exclude }}
+//* Output    : {{ new_shrnkwrp_dsn }}
+//*-----------------------------------------------------------------
+//STEP001  EXEC PGM=ADRDSSU{{ ",PARM='TYPRUN=NORUN'" if (typrun_norun | default(true) | bool) else '' }}
+//SHRNK1   DD  DISP=(,CATLG),
+//         UNIT=SYSALLDA,
+//         SPACE=(CYL,({{ shrnkwrp_space_primary | default(200) }},{{ shrnkwrp_space_secondary | default(50) }}),RLSE),
+//         DSN={{ new_shrnkwrp_dsn }}
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+  DUMP DATASET(INCLUDE(                            -
+               {{ shrnkwrp_include }}              -
+               )                                  -
+  EXCLUDE({{ shrnkwrp_exclude }}))                 -
+  OUTDD(SHRNK1) ALLEXCP ALLDAT(*) TOL(ENQF) SPHERE
+/*

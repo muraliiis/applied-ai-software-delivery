@@ -1,0 +1,280 @@
+---
+# Playbook : ddefupdt.yml
+# Purpose  : Update SMP/E DDDEF entries in GLOBAL, DISTRIBUTION, and TARGET zones
+#            after a COPYRENA restore to a new package qualifier.
+#            Equivalent to Steps 6-10 of the sdt-maintenance-refresh-agent pipeline.
+#
+# Usage (interactive — vars_prompt will fire):
+#   ansible-playbook playbooks/ddefupdt.yml
+#
+# Usage (non-interactive):
+#   ansible-playbook playbooks/ddefupdt.yml \
+#     -e "global_csi=ACSVS.TDMF.V5R11M0.ZOSMFB.GLOBAL.CSI" \
+#     -e "target_csi=ACSVS.TDMF.V5R11M0.ZOSMFB.TARGET.CSI" \
+#     -e "dlib_csi=ACSVS.TDMF.V5R11M0.ZOSMFB.DLIB.CSI" \
+#     -e "target_zone=TZONE" \
+#     -e "dlib_zone=DZONE" \
+#     -e "existing_qual_rest=TDMF.V5R11M0.ZOSMFA" \
+#     -e "new_qual_rest=TDMF.V5R11M0.ZOSMFB"
+#
+# AWX Survey variables: global_csi, target_csi, dlib_csi, target_zone, dlib_zone,
+#                       existing_qual_rest, new_qual_rest
+
+- name: SMP/E DDDEF Update (DDEFUPDT)
+  hosts: dcuf
+  gather_facts: false
+
+  vars_prompt:
+    - name: global_csi
+      prompt: "Enter Global CSI dataset name (e.g. ACSVS.TDMF.V5R11M0.ZOSMFB.GLOBAL.CSI)"
+      private: false
+
+    - name: target_csi
+      prompt: "Enter Target CSI dataset name (leave blank to use Global CSI)"
+      private: false
+      default: ""
+
+    - name: dlib_csi
+      prompt: "Enter Distribution CSI dataset name (leave blank to use Global CSI)"
+      private: false
+      default: ""
+
+    - name: target_zone
+      prompt: "Enter TARGET zone name (e.g. TZONE)"
+      private: false
+
+    - name: dlib_zone
+      prompt: "Enter DISTRIBUTION zone name (e.g. DZONE)"
+      private: false
+
+    - name: existing_qual_rest
+      prompt: "Enter old qualifier (qualifiers 2-N of existing package, e.g. TDMF.V5R11M0.ZOSMFA)"
+      private: false
+
+    - name: new_qual_rest
+      prompt: "Enter new qualifier (qualifiers 2-N of new package, e.g. TDMF.V5R11M0.ZOSMFB)"
+      private: false
+
+  pre_tasks:
+    - name: Ensure /tmp/zos_shell.sh wrapper is present
+      vars:
+        ansible_shell_executable: /bin/sh
+      raw: |
+        set -e
+        rm -f /tmp/zos_shell.sh
+        echo '#!/bin/sh'                                                                     > /tmp/zos_shell.sh
+        echo 'export _BPXK_AUTOCVT=ON'                                                     >> /tmp/zos_shell.sh
+        echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3'                                     >> /tmp/zos_shell.sh
+        echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+        echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+        echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13'                           >> /tmp/zos_shell.sh
+        echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"'                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_ERR=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_IN=txt'                                                    >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_OUT=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export LANG=C'                                                                >> /tmp/zos_shell.sh
+        echo 'for f in "${HOME}/.ansible/tmp/"*/AnsiballZ_*; do'                           >> /tmp/zos_shell.sh
+        echo '  [ -f "$f" ] && chtag -tc ISO8859-1 "$f" 2>/dev/null || true'              >> /tmp/zos_shell.sh
+        echo 'done'                                                                         >> /tmp/zos_shell.sh
+        echo 'exec /bin/sh "$@"'                                                           >> /tmp/zos_shell.sh
+        chmod +x /tmp/zos_shell.sh
+      changed_when: false
+
+    - name: Ensure logs directory exists on control node
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../logs"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+  tasks:
+    # ── 1. Validate inputs ────────────────────────────────────────────────
+    - name: Validate inputs
+      assert:
+        that:
+          - global_csi is defined and global_csi | length > 0
+          - target_zone is defined and target_zone | length > 0
+          - dlib_zone is defined and dlib_zone | length > 0
+          - existing_qual_rest is defined and existing_qual_rest | length > 0
+          - new_qual_rest is defined and new_qual_rest | length > 0
+        fail_msg: >-
+          global_csi, target_zone, dlib_zone, existing_qual_rest,
+          and new_qual_rest are all required.
+
+    # ── 2. Derive substitution values ─────────────────────────────────────
+    - name: Resolve CSI values and derived DDDEF variables
+      set_fact:
+        # Use global_csi as fallback if target/dlib CSI not separately specified
+        target_csi:       "{{ target_csi if (target_csi | default('') | length > 0) else global_csi }}"
+        dlib_csi:         "{{ dlib_csi   if (dlib_csi   | default('') | length > 0) else global_csi }}"
+        # SMPPTS DSN is under ACSNS. prefix with new qualifier
+        smppts_dsn:       "ACSNS.{{ new_qual_rest }}.SMPPTS"
+        # DDDEF CHANGE uses ACSNS. prefix with single-level wildcard
+        dddef_change_old: "ACSNS.{{ existing_qual_rest }}.*"
+        dddef_change_new: "ACSNS.{{ new_qual_rest }}.*"
+
+    # ── 3. Display run parameters ──────────────────────────────────────────
+    - name: Display run parameters
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           SMP/E DDDEF Update (DDEFUPDT)
+          ══════════════════════════════════════════════════════
+           Global CSI    : {{ global_csi }}
+           Target CSI    : {{ target_csi }}
+           Dlib CSI      : {{ dlib_csi }}
+           Target zone   : {{ target_zone }}
+           Dlib zone     : {{ dlib_zone }}
+           SMPPTS DSN    : {{ smppts_dsn }}
+           DDDEF old     : {{ dddef_change_old }}
+           DDDEF new     : {{ dddef_change_new }}
+          ══════════════════════════════════════════════════════
+
+    # ── 4. Generate and submit JCL ─────────────────────────────────────────
+    - name: Render DDEFUPDT JCL from template
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/ddefupdt.j2"
+        dest: "/tmp/ddefupdt_{{ inventory_hostname }}.jcl"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+    - name: Copy DDEFUPDT JCL to z/OS USS
+      ibm.ibm_zos_core.zos_copy:
+        src: "/tmp/ddefupdt_{{ inventory_hostname }}.jcl"
+        dest: "/tmp/ddefupdt_{{ inventory_hostname }}.jcl"
+        replace: true
+        binary: false
+        encoding:
+          from: UTF-8
+          to: IBM-1047
+      environment: "{{ environment_vars }}"
+
+    - name: Submit DDEFUPDT job
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "/tmp/ddefupdt_{{ inventory_hostname }}.jcl"
+        location: uss
+        wait_time: 600
+      environment: "{{ environment_vars }}"
+      register: _ddefupdt_submit
+      failed_when: false
+
+    - name: Fail if DDEFUPDT job could not be submitted
+      fail:
+        msg: >-
+          DDEFUPDT submission failed — no job_id returned.
+          Error: {{ _ddefupdt_submit.msg | default('unknown') }}
+      when: >-
+        _ddefupdt_submit.jobs is not defined
+        or _ddefupdt_submit.jobs | length == 0
+        or _ddefupdt_submit.jobs[0].job_id is not defined
+
+    # ── 5. Monitor job ─────────────────────────────────────────────────────
+    - name: Poll DDEFUPDT job until complete
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _ddefupdt_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _ddefupdt_poll
+      failed_when: false
+      until: >
+        _ddefupdt_poll.jobs is defined
+        and _ddefupdt_poll.jobs | length > 0
+        and ((_ddefupdt_poll.jobs[0].ret_code.code | default(none) is not none
+              and _ddefupdt_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+             or _ddefupdt_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+      retries: 60
+      delay: 10
+
+    - name: Re-verify DDEFUPDT job is not active
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _ddefupdt_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _ddefupdt_reverify
+
+    - name: Fail if DDEFUPDT job still active after poll
+      fail:
+        msg: >-
+          DDEFUPDT job {{ _ddefupdt_submit.jobs[0].job_id }} is still active.
+          Poll false-positive — increase delay or re-run.
+      when: >-
+        _ddefupdt_reverify.jobs is defined
+        and _ddefupdt_reverify.jobs | length > 0
+        and _ddefupdt_reverify.jobs[0].status | default('') | upper in ['AC', 'ACTIVE', 'INPUT', 'HELD']
+
+    - name: Capture DDEFUPDT RC
+      set_fact:
+        ddefupdt_rc: >-
+          {{ _ddefupdt_poll.jobs[0].ret_code.code | int
+             if (_ddefupdt_poll.jobs[0].ret_code is defined
+                 and _ddefupdt_poll.jobs[0].ret_code.code is not none
+                 and _ddefupdt_poll.jobs[0].ret_code.code | string != 'None')
+             else ((_ddefupdt_poll.jobs[0].ret_code.msg | default('CC 0000'))
+                   | regex_replace('^CC\s+0*(\d+).*', '\1') | default('0')) | int }}
+
+    # ── 6. Retrieve output ─────────────────────────────────────────────────
+    - name: Fetch DDEFUPDT full output
+      ibm.ibm_zos_core.zos_job_output:
+        job_id: "{{ _ddefupdt_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: ddefupdt_job
+
+    - name: Display DDEFUPDT result
+      debug:
+        msg: >-
+          Job {{ ddefupdt_job.jobs[0].job_name }}
+          ({{ ddefupdt_job.jobs[0].job_id }})
+          RC={{ ddefupdt_rc }}
+
+    - name: Fail if DDEFUPDT RC > 4
+      fail:
+        msg: >-
+          DDEFUPDT FAILED — RC={{ ddefupdt_rc }}.
+          Review SMPOUT for job {{ ddefupdt_job.jobs[0].job_id }}.
+          Common causes: SMPPTS DSN not found, CSI DSN not accessible,
+          zone name mismatch.
+      when: ddefupdt_rc | int > 4
+
+    - name: Extract and display GIM messages from SMPOUT
+      set_fact:
+        _ddefupdt_smpout: "{{ ddefupdt_job.jobs[0].ddnames
+          | selectattr('ddname', 'equalto', 'SMPOUT')
+          | map(attribute='content')
+          | list | first | default('') }}"
+      when: ddefupdt_job.jobs[0].ddnames is defined
+
+    - name: Display SMP/E GIM messages
+      debug:
+        msg: "{{ ((_ddefupdt_smpout is string) | ternary(_ddefupdt_smpout, _ddefupdt_smpout | join('\n'))) | regex_findall('GIM[0-9]+[A-Z]\\s.+') }}"
+      when: _ddefupdt_smpout is defined and _ddefupdt_smpout | length > 0
+
+    # ── 7. Audit log ───────────────────────────────────────────────────────
+    - name: Save DDEFUPDT audit log
+      copy:
+        content: "{{ ddefupdt_job | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../logs/ddefupdt_{{ new_qual_rest | replace('.', '_') }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      ignore_errors: true
+
+    # ── 8. Completion summary ──────────────────────────────────────────────
+    - name: Display completion summary
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           DDEFUPDT COMPLETE
+          ══════════════════════════════════════════════════════
+           Job         : {{ ddefupdt_job.jobs[0].job_name }} ({{ ddefupdt_job.jobs[0].job_id }})
+           RC          : {{ ddefupdt_rc }}
+           Global CSI  : {{ global_csi }}
+           Target CSI  : {{ target_csi }}
+           Dlib CSI    : {{ dlib_csi }}
+           DDDEF old   : {{ dddef_change_old }}
+           DDDEF new   : {{ dddef_change_new }}
+           Zones updated: GLOBAL + {{ dlib_zone }} + {{ target_zone }}
+          ══════════════════════════════════════════════════════

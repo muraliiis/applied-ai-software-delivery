@@ -1,0 +1,22 @@
+---
+# group_vars/staging.yml
+# Overrides for the STAGING environment
+
+# ─────────────────────────────────────────────
+# z/OSMF Host (staging)
+# ─────────────────────────────────────────────
+zmf_host: "138.69.218.201"
+
+# ─────────────────────────────────────────────
+# SMP/E Staging Zone Config
+# ─────────────────────────────────────────────
+smpe_csi_hlq: "SMPE.STG"
+smpe_global_zone: "GLOBAL"
+
+change_management_required: true
+peer_review_required: false
+
+# Staging allows broader bypass for pre-production testing
+smpe_bypass_holds: "HOLDERROR,HOLDCLASS(DOC,FIXCAT,HIPER)"
+
+rollback_on_failure: true

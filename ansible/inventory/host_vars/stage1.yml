@@ -1,0 +1,15 @@
+---
+# host_vars/stage1.yml
+# Host-specific variables for LPAR: STG1 (staging)
+
+ansible_host: 138.69.218.201
+ansible_user: syssa69
+ansible_password: "{{ vault_stage1_password }}"
+
+lpar_name: STG1
+sysplex_name: STGPLEX
+
+smpe_target_zone: MVSS100
+smpe_dlib_zone: MVSS100D
+
+zmf_system_nickname: STG1

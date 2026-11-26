@@ -1,0 +1,138 @@
+---
+# group_vars/all.yml
+# Applies to ALL hosts across all environments
+# ibm_zos_core v1.6.0 — Required environment configuration
+
+# ─────────────────────────────────────────────
+# Ansible Connection
+# ─────────────────────────────────────────────
+# Wrapper script pre-sets _BPXK_AUTOCVT=ON and ZOAU env before exec'ing /bin/sh.
+# Required because z/OS SSH non-login sessions do NOT source ~/.profile, so
+# _BPXK_AUTOCVT=ON is never active for Ansible's remote commands.
+# The wrapper also chtags AnsiballZ REXX files as ISO8859-1 so ibm_zos_core
+# modules can be auto-converted from ASCII to EBCDIC at execution time.
+ansible_shell_executable: /tmp/zos_shell.sh
+
+# IBM Open Enterprise SDK for Python 3.13 (5655-PYT) — confirmed from .profile
+ansible_python_interpreter: /usr/lpp/IBM/cyp/v3r13/pyz/bin/python3
+
+# ─────────────────────────────────────────────
+# z/OS Environment Variables (ZOAU + Python)
+# Required by ibm_zos_core modules at runtime
+# ─────────────────────────────────────────────
+environment_vars:
+  # Auto-convert untagged files — required for ibm_zos_core
+  _BPXK_AUTOCVT: "ON"
+
+  # IBM Z Open Automation Utilities v1r3 — confirmed from .profile
+  ZOAU_HOME: "/usr/lpp/IBM/zoau/v1r3"
+
+  # Prepend ZOAU and Python bin directories
+  PATH: "/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin"
+
+  # ZOAU and Python shared libraries
+  LIBPATH: "/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:."
+
+  # ZOAU Python bindings for Python 3.13
+  PYTHONPATH: "/usr/lpp/IBM/zoau/v1r3/lib/3.13"
+
+  # Language Environment runtime options — required for USS open edition
+  _CEE_RUNOPTS: "FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"
+
+  # Tag redirected I/O as text (required for proper encoding handling)
+  _TAG_REDIR_ERR: "txt"
+  _TAG_REDIR_IN: "txt"
+  _TAG_REDIR_OUT: "txt"
+
+  # Locale — use C to avoid EBCDIC collation issues
+  LANG: "C"
+
+# ─────────────────────────────────────────────
+# SMP/E Configuration — DCUF z/OS V2.4 (Active Suite A)
+# Source: dcuf-system-info-doc SKILL.md
+# ─────────────────────────────────────────────
+smpe_csi_hlq:     "SMPE.ZS24M27.R2006"
+smpe_global_csi:  "SMPE.ZS24M27.R2006.GLOBAL.CSI"
+smpe_target_csi:  "SMPE.ZS24M27.R2006.TARGET.CSI"
+smpe_dlib_csi:    "SMPE.ZS24M27.R2006.DLIB.CSI"
+smpe_proc:        "SMPEZS24"
+smpe_proclib:     "SYS2.PROCLIB.DCUF"
+smpe_global_zone: "GLOBAL"
+
+# SMP/E job card defaults (override per environment/host if needed)
+smpe_job_class:    "A"
+smpe_job_msgclass: "X"
+smpe_job_acct:     ""
+
+# BYPASS operands for APPLY / APPLY CHECK
+# DOC and FIXCAT are safe to bypass; HOLDSYS requires explicit approval
+smpe_bypass_holds: "HOLDERROR,HOLDCLASS(DOC,FIXCAT)"
+
+# ─────────────────────────────────────────────
+# SMP/E Internet Delivery (RECEIVE ORDER via GIMSMP/HTTPS)
+# Source: ACSNS.IBM.SAMPLE.JCLS(RSUORDER), SYSSA69.SMPE.JCLLIB(ORDRFMID)
+# ─────────────────────────────────────────────
+# Java home for SMP/E HTTPS client
+smpe_javahome:        "/usr/lpp/java/J21.0_64/"
+# SMP/E Java classpath
+smpe_classpath:       "/usr/lpp/smp/classes"
+# IBM ECC/ECurep order server URL
+smpe_orderserver_url: "https://eccgw01.boulder.ibm.com/services/projects/ecc/ws/"
+# RACF keyring for SSL server integrity verification (SECINT)
+smpe_secint_keyring:  "FTPACS/DCUFSMPE_SECINTKEYRING"
+# RACF keyring for SMP/E client certificate (signature/download)
+smpe_client_keyring:  "FTPACS/DCUFSMPE_KEYRING"
+# Default SMPNTS staging directory (must exist on USS before job runs)
+smpe_nts_path_ibm:       "/maint_zfs"
+smpe_nts_path_broadcom:  "/maint_zfs"
+smpe_nts_path_bmc:       "/maint_zfs"
+
+# ─────────────────────────────────────────────
+# SMP/E Internet Delivery — Broadcom (GIMSMP/HTTPS)
+# Source: ACSNS.CA.SAMPLE.JCLS(BCOMORDR)
+# ─────────────────────────────────────────────
+# Broadcom uses older Java (J8.0) — override smpe_javahome for this vendor
+smpe_javahome_broadcom:         "/usr/lpp/java/J8.0/"
+# Broadcom order server URL
+smpe_broadcom_orderserver_url:  "https://eapi.broadcom.com/receiveorder"
+# RACF keyring for Broadcom HTTPS authentication (sign + download)
+smpe_broadcom_keyring:          "FTPACS/BCOMSMPE_KEYRING"
+# Certificate label in the Broadcom keyring
+smpe_broadcom_certificate:      "BCOM SMPE Client Certificate"
+# Optional: target zones filter (FORTGTZONES) — leave empty to omit
+smpe_broadcom_target_zones:     ""
+
+# ─────────────────────────────────────────────
+# SMP/E Internet Delivery — BMC (GIMSMP/HTTPS)
+# Source: ACSNS.BMC.SAMPLE.JCLS(BMCORDER)
+# ─────────────────────────────────────────────
+# BMC uses older Java (J8.0) — override smpe_javahome for this vendor
+smpe_javahome_bmc:          "/usr/lpp/java/J8.0/"
+# BMC order server URL
+smpe_bmc_orderserver_url:   "https://ws-prod.bmc.com/smpe"
+# RACF keyring for BMC HTTPS authentication
+smpe_bmc_keyring:           "FTPACS/BMCSMPE_KEYRING"
+# Certificate label in the BMC keyring
+smpe_bmc_certificate:       "BMC SMPE Client Certificate"
+# Optional: target zones filter (FORTGTZONES) — leave empty to omit
+smpe_bmc_target_zones:      ""
+
+# ─────────────────────────────────────────────
+# Staging / Transfer Paths (USS)
+# ─────────────────────────────────────────────
+package_staging_dir: "/u/staging/packages"
+backup_dir: "/u/backups"
+
+# ─────────────────────────────────────────────
+# Job Submission Timeouts (seconds)
+# ─────────────────────────────────────────────
+job_wait_timeout: 3600
+transfer_timeout: 1800
+
+# ─────────────────────────────────────────────
+# z/OSMF Connection (for software management)
+# Override per environment in group_vars/production.yml etc.
+# ─────────────────────────────────────────────
+zmf_port: 443
+zmf_user: "{{ vault_zmf_user }}"
+zmf_password: "{{ vault_zmf_password }}"

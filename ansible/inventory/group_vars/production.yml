@@ -1,0 +1,25 @@
+---
+# group_vars/production.yml
+# Overrides for the PRODUCTION environment
+
+# ─────────────────────────────────────────────
+# z/OSMF Host (production)
+# ─────────────────────────────────────────────
+zmf_host: "138.69.218.201"
+
+# ─────────────────────────────────────────────
+# SMP/E Production Zone Config
+# ─────────────────────────────────────────────
+smpe_csi_hlq: "SMPE.PROD"
+smpe_global_zone: "GLOBAL"
+
+# Change management — production requires peer approval before deployment
+change_management_required: true
+peer_review_required: true
+
+# SMP/E APPLY bypass rules — production is more restrictive
+# Only bypass documented/fixcat holds; NEVER bypass PE holds without approval
+smpe_bypass_holds: "HOLDERROR,HOLDCLASS(DOC,FIXCAT)"
+
+# Rollback enabled in production
+rollback_on_failure: true

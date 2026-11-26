@@ -1,0 +1,28 @@
+---
+# Ansible Galaxy Collection Requirements
+# Install with: ansible-galaxy collection install -r ansible/requirements.yml
+#
+# Pin minor versions — patch releases are auto-included within the range.
+# Re-run the install command after updating version constraints.
+
+collections:
+
+  # ── IBM z/OS Core ────────────────────────────────────────────────────────
+  # Foundation collection: zos_job_submit, zos_operator, zos_data_set, etc.
+  # https://galaxy.ansible.com/ui/repo/published/ibm/ibm_zos_core/
+  - name: ibm.ibm_zos_core
+    version: ">=1.9.0,<2.0.0"
+
+  # ── IBM z/OS CICS (optional — include if CICS tasks are automated) ───────
+  # https://galaxy.ansible.com/ui/repo/published/ibm/ibm_zos_cics/
+  # - name: ibm.ibm_zos_cics
+  #   version: ">=1.0.0,<2.0.0"
+
+  # ── IBM z/OS IMS (optional — include if IMS tasks are automated) ─────────
+  # https://galaxy.ansible.com/ui/repo/published/ibm/ibm_zos_ims/
+  # - name: ibm.ibm_zos_ims
+  #   version: ">=1.0.0,<2.0.0"
+
+  # ── Community General (utility modules: community.general.ini_file, etc.) ─
+  - name: community.general
+    version: ">=7.0.0,<10.0.0"

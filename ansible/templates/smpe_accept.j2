@@ -1,0 +1,28 @@
+//{{ _vendor_jobpfx }}{{ 'ACK' if (accept_check_mode | default(true)) else 'ACC' }}   JOB ({{ smpe_job_acct | default('') }}),'{{ 'SMP/E ACCEPT CHECK' if (accept_check_mode | default(true)) else 'SMP/E ACCEPT' }}',
+//         CLASS={{ smpe_job_class | default('A') }},
+//         MSGCLASS={{ smpe_job_msgclass | default('X') }},
+//         NOTIFY=&SYSUID,MSGLEVEL=(1,1)
+//*-----------------------------------------------------------------
+//* SMP/E {{ 'ACCEPT CHECK  -  dry-run before production ACCEPT' if (accept_check_mode | default(true)) else 'ACCEPT  -  promote SYSMODs from TARGET to DLIB zone' }}
+//* Generated : {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host      : {{ inventory_hostname }}
+//* CSI       : {{ smpe_csi_dsn | default(smpe_global_csi) }}
+//* Dlib zone : {{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}
+//*-----------------------------------------------------------------
+//ACCPTCHK EXEC PGM=GIMSMP,PARM='DATE=U',REGION=0M
+//SMPCSI   DD  DISP=SHR,DSN={{ smpe_csi_dsn | default(smpe_global_csi) }}
+//SMPHOLD  DD SYSOUT=*
+//SMPOUT   DD SYSOUT=*
+//SMPRPT   DD SYSOUT=*
+//SMPLIST  DD SYSOUT=*
+//SYSPRINT DD SYSOUT=*
+//SMPWRK1  DD UNIT=SYSALLDA,SPACE=(CYL,(100,25,100))
+//SMPWRK2  DD UNIT=SYSALLDA,SPACE=(CYL,(100,25,100))
+//SMPWRK3  DD UNIT=SYSALLDA,SPACE=(CYL,(100,25,100))
+//SMPWRK4  DD UNIT=SYSALLDA,SPACE=(CYL,(100,25,100))
+//SMPWRK6  DD UNIT=SYSALLDA,SPACE=(CYL,(300,30,90))
+//SMPCNTL  DD  *
+    SET BDY({{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}).
+    ACCEPT{{ ' CHECK' if (accept_check_mode | default(true)) else '' }}
+    BYPASS(HOLDSYS) .
+/*

@@ -1,0 +1,62 @@
+---
+# playbooks/setup-zos-env.yml
+# Bootstrap playbook — creates /tmp/zos_shell.sh on every managed node.
+#
+# WHY THIS EXISTS:
+#   z/OS SSH sessions are non-login shells and do NOT source ~/.profile.
+#   Without _BPXK_AUTOCVT=ON in the shell environment, ibm_zos_core REXX
+#   modules (AnsiballZ_*.rexx) are read as EBCDIC instead of ASCII, causing:
+#     FSUM7332 syntax error: got (, expecting Newline
+#
+#   The wrapper script:
+#     1. Exports _BPXK_AUTOCVT=ON and all required ZOAU/Python env vars.
+#     2. chtags each *.rexx file in the Ansible command as ISO8859-1 so
+#        z/OS auto-converts ASCII bytes to EBCDIC at execution time.
+#     3. Execs /bin/sh with the original arguments transparently.
+#
+# WHEN TO RUN:
+#   - Once after initial setup.
+#   - After every LPAR IPL (/tmp is cleared on IPL).
+#   - site.yml imports this automatically as the first play.
+#
+# Usage (standalone):
+#   ansible-playbook playbooks/setup-zos-env.yml -i inventory/hosts.yml --ask-pass
+#   ansible-playbook playbooks/setup-zos-env.yml -i inventory/hosts.yml --ask-pass -l dev1
+
+- name: Bootstrap z/OS environment wrapper
+  hosts: "{{ target | default('all') }}"
+  gather_facts: false
+  vars:
+    # Override shell for this play only — wrapper may not exist yet on a fresh node.
+    ansible_shell_executable: /bin/sh
+
+  tasks:
+    - name: Create /tmp/zos_shell.sh
+      raw: |
+        echo '#!/bin/sh' > /tmp/zos_shell.sh
+        echo 'export _BPXK_AUTOCVT=ON' >> /tmp/zos_shell.sh
+        echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3' >> /tmp/zos_shell.sh
+        echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13' >> /tmp/zos_shell.sh
+        echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+        echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+        echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"' >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_ERR=txt' >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_IN=txt' >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_OUT=txt' >> /tmp/zos_shell.sh
+        echo 'export LANG=C' >> /tmp/zos_shell.sh
+        echo 'if [ "$1" = "-c" ] && [ -n "$2" ]; then' >> /tmp/zos_shell.sh
+        echo '  for word in $2; do' >> /tmp/zos_shell.sh
+        echo '    case "$word" in' >> /tmp/zos_shell.sh
+        echo '      *.rexx) if [ -f "$word" ]; then chtag -tc ISO8859-1 "$word" 2>/dev/null; fi;;' >> /tmp/zos_shell.sh
+        echo '    esac' >> /tmp/zos_shell.sh
+        echo '  done' >> /tmp/zos_shell.sh
+        echo 'fi' >> /tmp/zos_shell.sh
+        echo 'exec /bin/sh "$@"' >> /tmp/zos_shell.sh
+        chmod +x /tmp/zos_shell.sh
+      changed_when: true
+
+    - name: Verify wrapper is executable
+      raw: test -x /tmp/zos_shell.sh && echo OK
+      register: verify
+      changed_when: false
+      failed_when: "'OK' not in verify.stdout"

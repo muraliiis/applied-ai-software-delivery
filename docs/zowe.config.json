@@ -1,0 +1,49 @@
+{
+  "$schema": "./zowe.schema.json",
+  "profiles": {
+    "dcuf": {
+      "type": "zosmf",
+      "properties": {
+        "host": "localhost",
+        "port": 443,
+        "basePath": "/zosmf",
+        "rejectUnauthorized": false,
+        "protocol": "https"
+      },
+      "secure": [
+        "user",
+        "password"
+      ]
+    },
+    "dcuf_ssh": {
+      "type": "ssh",
+      "properties": {
+        "host": "138.69.218.201",
+        "port": 22,
+        "user": "syssa69"
+      },
+      "secure": [
+        "privateKey"
+      ]
+    },
+    "dcub": {
+      "type": "zosmf",
+      "properties": {
+        "host": "localhost",
+        "port": 443,
+        "basePath": "/zosmf",
+        "rejectUnauthorized": false,
+        "protocol": "https"
+      },
+      "secure": [
+        "user",
+        "password"
+      ]
+    }
+  },
+  "defaults": {
+    "zosmf": "dcuf",
+    "ssh": "dcuf_ssh"
+  },
+  "autoStore": true
+}

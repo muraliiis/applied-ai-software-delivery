@@ -1,0 +1,49 @@
+---
+# maintenance-defaults.yml
+# Product catalog for internet-maintenance.yml
+# Each entry drives one maintenance cycle: no interactive prompts needed.
+#
+# Usage (wrapper script reads this file — see scripts/bash/run-maintenance.sh):
+#   run-maintenance.sh [product-key]   # e.g.  run-maintenance.sh tdmf-zosmfa
+#   run-maintenance.sh                 # runs all products in sequence
+#
+# Usage (direct Ansible, bypassing vars_prompt):
+#   ansible-playbook playbooks/internet-maintenance.yml \
+#     -e "vendor=ibm" \
+#     -e "smpe_csi_dsn=ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI" \
+#     -e "smpe_target_zone_input=TZONE" \
+#     -e "smpe_dlib_zone_input=DZONE"
+
+maintenance_products:
+
+  # ── IBM products ───────────────────────────────────────────────────────────
+  tdmf-zosmfa:
+    vendor:              ibm
+    smpe_csi_dsn:        ACSVS.TDMF.V5R11M0.ZOSMFA.GLOBAL.CSI
+    smpe_target_zone:    TZONE
+    smpe_dlib_zone:      DZONE
+    description:         "TDMF z/OSMF Agent V5R11M0"
+
+  # Example: add more IBM products below
+  # sdk-java:
+  #   vendor:              ibm
+  #   smpe_csi_dsn:        ACSVS.IBM.SDKJAV2.V8R0.CSI
+  #   smpe_target_zone:    TZONE
+  #   smpe_dlib_zone:      DZONE
+  #   description:         "IBM SDK for Java 8.0"
+
+  # ── Broadcom products ─────────────────────────────────────────────────────
+  # ca-maint-1:
+  #   vendor:              broadcom
+  #   smpe_csi_dsn:        CASITE.MAINT.GLOBAL.CSI
+  #   smpe_target_zone:    CATZONE
+  #   smpe_dlib_zone:      CADZONE
+  #   description:         "CA Mainframe Software (example)"
+
+  # ── BMC products ──────────────────────────────────────────────────────────
+  # bmc-product-1:
+  #   vendor:              bmc
+  #   smpe_csi_dsn:        BMC.PROD.GLOBAL.CSI
+  #   smpe_target_zone:    TZONE
+  #   smpe_dlib_zone:      DZONE
+  #   description:         "BMC Product (example)"

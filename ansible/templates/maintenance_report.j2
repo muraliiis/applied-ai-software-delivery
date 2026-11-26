@@ -1,0 +1,201 @@
+# SMP/E Internet Maintenance Report — {{ _vendor_key | upper }}
+
+| | |
+|---|---|
+| **Generated** | {{ now(fmt='%Y-%m-%d %H:%M:%S') }} |
+| **Vendor** | {{ _vendor_key | upper }} |
+| **SMPCSI** | {{ smpe_csi_dsn }} |
+| **Target Zone** | {{ smpe_target_zone }} |
+| **Dlib Zone** | {{ smpe_dlib_zone_input | default(smpe_dlib_zone) }} |
+
+---
+
+## Executive Summary
+
+| Phase | Job Name | Job ID | RC | SYSMODs |
+|-------|----------|--------|----|--------:|
+{% if receive_job is defined and receive_job.jobs is defined %}
+| RECEIVE | {{ receive_job.jobs[0].job_name }} | {{ receive_job.jobs[0].job_id }} | {{ receive_job.jobs[0].ret_code.code }} | {{ received_sysmod_list | default([]) | length }} |
+{% else %}
+| RECEIVE | (skipped) | — | — | {{ received_sysmod_list | default([]) | length }} |
+{% endif %}
+{% if apply_check_job is defined and apply_check_job.jobs is defined %}
+| APPLY CHECK | {{ apply_check_job.jobs[0].job_name }} | {{ apply_check_job.jobs[0].job_id }} | {{ apply_check_job.jobs[0].ret_code.code }} | {{ applycheck_approved_list | default([]) | length }} approved |
+{% else %}
+| APPLY CHECK | (skipped) | — | — | — |
+{% endif %}
+| **APPLY GATE** | — | — | {{ '✅ APPROVED' if (technician_response is defined and technician_response.user_input | default('') | lower | trim == 'yes') else '(not recorded)' }} | — |
+{% if apply_job is defined and apply_job.jobs is defined %}
+| APPLY | {{ apply_job.jobs[0].job_name }} | {{ apply_job.jobs[0].job_id }} | {{ apply_job.jobs[0].ret_code.code }} | {{ applied_sysmod_list | default([]) | length }} |
+{% else %}
+| APPLY | (skipped) | — | — | {{ applied_sysmod_list | default([]) | length }} |
+{% endif %}
+{% if accept_check_job is defined and accept_check_job.jobs is defined %}
+| ACCEPT CHECK | {{ accept_check_job.jobs[0].job_name }} | {{ accept_check_job.jobs[0].job_id }} | {{ accept_check_job.jobs[0].ret_code.code }} | {{ acceptcheck_approved_list | default([]) | length }} approved |
+{% else %}
+| ACCEPT CHECK | (skipped) | — | — | — |
+{% endif %}
+| **ACCEPT GATE** | — | — | {{ '✅ APPROVED' if (accept_response is defined and accept_response.user_input | default('') | lower | trim == 'yes') else '(not recorded)' }} | — |
+{% if accept_job is defined and accept_job.jobs is defined %}
+| ACCEPT | {{ accept_job.jobs[0].job_name }} | {{ accept_job.jobs[0].job_id }} | {{ accept_job.jobs[0].ret_code.code }} | {{ accepted_sysmod_list | default([]) | length }} |
+{% else %}
+| ACCEPT | (skipped) | — | — | {{ accepted_sysmod_list | default([]) | length }} |
+{% endif %}
+
+---
+
+## Phase 1 — RECEIVE
+
+{% if received_sysmod_list | default([]) | length > 0 %}
+**{{ received_sysmod_list | default([]) | length }} SYSMODs received into SMPPTS**
+
+{% for s in received_sysmod_list | default([]) %}
+- `{{ s }}`
+{% endfor %}
+{% else %}
+*(RECEIVE skipped or no SYSMODs parsed)*
+{% endif %}
+
+---
+
+## Phase 2 — APPLY CHECK
+
+{% if applycheck_approved_list | default([]) | length > 0 %}
+**Approved for APPLY: {{ applycheck_approved_list | default([]) | length }} SYSMODs**
+
+{% for s in applycheck_approved_list | default([]) %}
+- `{{ s }}`
+{% endfor %}
+
+{% set _not_applied = received_sysmod_list | default([]) | difference(applycheck_approved_list | default([])) %}
+{% if _not_applied | length > 0 %}
+**Not queued for APPLY: {{ _not_applied | length }} SYSMODs** *(superseded or already at level)*
+
+{% for s in _not_applied %}
+- `{{ s }}`
+{% endfor %}
+{% endif %}
+{% else %}
+*(APPLY CHECK skipped or no SYSMODs parsed)*
+{% endif %}
+
+---
+
+## Phase 3 — Technician Review Gate (APPLY)
+
+{% if technician_response is defined %}
+**Decision:** {{ '✅ APPROVED — APPLY was permitted to proceed' if technician_response.user_input | default('') | lower | trim == 'yes' else '❌ REJECTED — APPLY was aborted' }}
+{% else %}
+*(Gate not recorded — playbook started after Phase 3)*
+{% endif %}
+
+---
+
+## Phase 4 — APPLY
+
+{% if applied_sysmod_list | default([]) | length > 0 %}
+**{{ applied_sysmod_list | default([]) | length }} SYSMODs applied to {{ smpe_target_zone }}**
+
+{% set _apply_delta = received_sysmod_list | default([]) | difference(applied_sysmod_list | default([])) %}
+{% if _apply_delta | length > 0 %}
+> **Delta:** {{ _apply_delta | length }} received but not applied: `{{ _apply_delta | join('  ') }}`
+{% else %}
+> All received SYSMODs were applied.
+{% endif %}
+
+{% for s in applied_sysmod_list | default([]) %}
+- `{{ s }}`
+{% endfor %}
+{% else %}
+*(APPLY skipped or no SYSMODs parsed)*
+{% endif %}
+
+---
+
+## Phase 5 — ACCEPT CHECK
+
+{% if acceptcheck_approved_list | default([]) | length > 0 %}
+**Approved for ACCEPT: {{ acceptcheck_approved_list | default([]) | length }} SYSMODs**
+
+{% for s in acceptcheck_approved_list | default([]) %}
+- `{{ s }}`
+{% endfor %}
+{% else %}
+*(ACCEPT CHECK skipped or no SYSMODs parsed)*
+{% endif %}
+
+---
+
+## Phase 5b — Technician Review Gate (ACCEPT)
+
+{% if accept_response is defined %}
+**Decision:** {{ '✅ APPROVED — ACCEPT was permitted to proceed' if accept_response.user_input | default('') | lower | trim == 'yes' else '⏭ SKIPPED — ACCEPT was not run' }}
+{% else %}
+*(Gate not recorded — playbook started after Phase 5b)*
+{% endif %}
+
+---
+
+## Phase 5 — ACCEPT
+
+{% if accepted_sysmod_list | default([]) | length > 0 %}
+**{{ accepted_sysmod_list | default([]) | length }} SYSMODs accepted into {{ smpe_dlib_zone_input | default(smpe_dlib_zone) }}**
+
+{% set _accept_delta = acceptcheck_approved_list | default([]) | difference(accepted_sysmod_list | default([])) %}
+{% if _accept_delta | length > 0 %}
+> **Delta:** {{ _accept_delta | length }} approved by CHECK but not accepted: `{{ _accept_delta | join('  ') }}`
+{% else %}
+> ACCEPT CHECK count matches ACCEPT count.
+{% endif %}
+
+{% for s in accepted_sysmod_list | default([]) %}
+- `{{ s }}`
+{% endfor %}
+{% else %}
+*(ACCEPT skipped or no SYSMODs parsed)*
+{% endif %}
+
+---
+
+## Full SYSMOD Traceability: RECEIVE → APPLY → ACCEPT
+
+{% set all_sysmods = (received_sysmod_list | default([]) + applied_sysmod_list | default([]) + acceptcheck_approved_list | default([]) + accepted_sysmod_list | default([])) | unique | sort %}
+{% if all_sysmods | length > 0 %}
+| SYSMOD | RECEIVED | APPLIED | ACCEPTED | NOTES |
+|--------|:--------:|:-------:|:--------:|-------|
+{% for s in all_sysmods %}
+{% set _rcvd    = s in received_sysmod_list | default([]) %}
+{% set _applied = s in applied_sysmod_list  | default([]) %}
+{% set _accepted= s in accepted_sysmod_list | default([]) %}
+{% set _in_apk  = s in applycheck_approved_list | default([]) %}
+{% if _rcvd and not _in_apk and not _applied %}
+{% set _note = 'SUPERSEDED' %}
+{% elif _applied and not _rcvd %}
+{% set _note = 'Requisite (from SMPPTS)' %}
+{% elif _accepted and not _rcvd and not _applied %}
+{% set _note = 'Pre-existing in TARGET' %}
+{% else %}
+{% set _note = '' %}
+{% endif %}
+| `{{ s }}` | {{ 'YES' if _rcvd else '-' }} | {{ 'YES' if _applied else '-' }} | {{ 'YES' if _accepted else '-' }} | {{ _note }} |
+{% endfor %}
+{% else %}
+| *(no SYSMODs parsed — check audit logs)* | — | — | — | — |
+{% endif %}
+
+---
+
+## Phase Report Files
+
+| Phase | Report file |
+|-------|-------------|
+| Phase 1 RECEIVE | `logs/phase1_receive_{{ _vendor_key }}_*.md` |
+| Phase 2 APPLY CHECK | `logs/phase2_applycheck_{{ _vendor_key }}_*.md` |
+| Phase 4 APPLY | `logs/phase4_apply_{{ _vendor_key }}_*.md` |
+| Phase 5 ACCEPT CHECK | `logs/phase5_acceptcheck_{{ _vendor_key }}_*.md` |
+| Full Report | `logs/maintenance_report_{{ _vendor_key }}_*.md` |
+| Audit JSON logs | `logs/internet_*_{{ _vendor_key }}_*.json` |
+
+---
+*Generated by internet-maintenance.yml — {{ _vendor_key | upper }} — {{ now(fmt='%Y-%m-%d %H:%M:%S') }}*
+

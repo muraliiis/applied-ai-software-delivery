@@ -1,0 +1,286 @@
+---
+# Playbook : shrinkwrap.yml
+# Purpose  : ADRDSSU DUMP — create a shrinkwrap backup of all datasets under
+#            the new package qualifier. Equivalent to Steps 11-14 of the
+#            sdt-maintenance-refresh-agent pipeline.
+#
+# Usage (interactive — vars_prompt will fire):
+#   ansible-playbook playbooks/shrinkwrap.yml
+#
+# Usage (non-interactive, dry run — default):
+#   ansible-playbook playbooks/shrinkwrap.yml \
+#     -e "new_qual=ACS%S.TDMF.V5R11M0.ZOSMFB" \
+#     -e "userid_node=ZS31D"
+#
+# Usage (live run):
+#   ansible-playbook playbooks/shrinkwrap.yml \
+#     -e "new_qual=ACS%S.TDMF.V5R11M0.ZOSMFB" \
+#     -e "userid_node=ZS31D" \
+#     -e "typrun_norun=false"
+#
+# AWX Survey variables: new_qual, userid_node, typrun_norun,
+#                       shrnkwrp_space_primary, shrnkwrp_space_secondary
+
+- name: ADRDSSU Shrinkwrap Backup (SHRNKWRP)
+  hosts: dcuf
+  gather_facts: false
+
+  vars_prompt:
+    - name: new_qual
+      prompt: "Enter new package qualifier (e.g. ACS%S.TDMF.V5R11M0.ZOSMFB)"
+      private: false
+
+    - name: userid_node
+      prompt: "Enter shrinkwrap node (e.g. ZS31D for z/OS 3.1, ZS32D for z/OS 3.2)"
+      private: false
+
+    - name: typrun_norun
+      prompt: "Dry run? (true=TYPRUN=NORUN validates dataset list only, false=creates output) [true]"
+      private: false
+      default: "true"
+
+  vars:
+    # Space allocation — override via -e if needed
+    shrnkwrp_space_primary:   200
+    shrnkwrp_space_secondary: 50
+
+  pre_tasks:
+    - name: Ensure /tmp/zos_shell.sh wrapper is present
+      vars:
+        ansible_shell_executable: /bin/sh
+      raw: |
+        set -e
+        rm -f /tmp/zos_shell.sh
+        echo '#!/bin/sh'                                                                     > /tmp/zos_shell.sh
+        echo 'export _BPXK_AUTOCVT=ON'                                                     >> /tmp/zos_shell.sh
+        echo 'export ZOAU_HOME=/usr/lpp/IBM/zoau/v1r3'                                     >> /tmp/zos_shell.sh
+        echo 'export PATH=/usr/lpp/IBM/zoau/v1r3/bin:/usr/lpp/IBM/cyp/v3r13/pyz/bin:/bin:/usr/bin' >> /tmp/zos_shell.sh
+        echo 'export LIBPATH=/usr/lpp/IBM/zoau/v1r3/lib:/usr/lpp/IBM/cyp/v3r13/pyz/lib:/lib:/usr/lib:.' >> /tmp/zos_shell.sh
+        echo 'export PYTHONPATH=/usr/lpp/IBM/zoau/v1r3/lib/3.13'                           >> /tmp/zos_shell.sh
+        echo 'export _CEE_RUNOPTS="FILETAG(AUTOCVT,AUTOTAG) POSIX(ON)"'                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_ERR=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_IN=txt'                                                    >> /tmp/zos_shell.sh
+        echo 'export _TAG_REDIR_OUT=txt'                                                   >> /tmp/zos_shell.sh
+        echo 'export LANG=C'                                                                >> /tmp/zos_shell.sh
+        echo 'for f in "${HOME}/.ansible/tmp/"*/AnsiballZ_*; do'                           >> /tmp/zos_shell.sh
+        echo '  [ -f "$f" ] && chtag -tc ISO8859-1 "$f" 2>/dev/null || true'              >> /tmp/zos_shell.sh
+        echo 'done'                                                                         >> /tmp/zos_shell.sh
+        echo 'exec /bin/sh "$@"'                                                           >> /tmp/zos_shell.sh
+        chmod +x /tmp/zos_shell.sh
+      changed_when: false
+
+    - name: Ensure logs directory exists on control node
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../logs"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+  tasks:
+    # ── 1. Validate inputs ────────────────────────────────────────────────
+    - name: Validate inputs
+      assert:
+        that:
+          - new_qual is defined and new_qual | length > 0
+          - userid_node is defined and userid_node | length > 0
+          - new_qual.split('.') | length >= 2
+        fail_msg: "new_qual and userid_node are required. new_qual must have at least 2 qualifiers."
+
+    # ── 2. Derive substitution values ─────────────────────────────────────
+    - name: Derive shrinkwrap variables from new_qual and userid_node
+      set_fact:
+        _new_qual_rest:      "{{ new_qual.split('.')[1:] | join('.') }}"
+
+    - name: Set ADRDSSU DUMP substitution variables
+      set_fact:
+        # Output DSN: ACSNS. + qual2-N + . + userid_node + .SHRNKWRP
+        new_shrnkwrp_dsn:    "ACSNS.{{ _new_qual_rest }}.{{ userid_node }}.SHRNKWRP"
+        # INCLUDE: ACS%S.** — captures both ACSNS and ACSVS datasets
+        shrnkwrp_include:    "ACS%S.{{ _new_qual_rest }}.**"
+        # EXCLUDE: the output DSN itself (prevents self-reference in dump)
+        shrnkwrp_exclude:    "ACSNS.{{ _new_qual_rest }}.{{ userid_node }}.SHRNKWRP"
+
+    # ── 3. Display run parameters ──────────────────────────────────────────
+    - name: Display run parameters
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           ADRDSSU Shrinkwrap Backup (SHRNKWRP)
+          ══════════════════════════════════════════════════════
+           New qual         : {{ new_qual }}
+           Userid node      : {{ userid_node }}
+           Output DSN       : {{ new_shrnkwrp_dsn }}
+           INCLUDE pattern  : {{ shrnkwrp_include }}
+           EXCLUDE pattern  : {{ shrnkwrp_exclude }}
+           Space primary    : {{ shrnkwrp_space_primary }} CYL
+           Space secondary  : {{ shrnkwrp_space_secondary }} CYL
+           Mode             : {{ 'DRY RUN (TYPRUN=NORUN)' if (typrun_norun | bool) else 'LIVE RUN' }}
+          ══════════════════════════════════════════════════════
+
+    # ── 4. Scratch existing output DSN (live run only) ─────────────────────
+    # Prevents ADR014E "dataset already exists" on ADRDSSU DUMP
+    - name: Scratch existing shrinkwrap output DSN if present (live run only)
+      ibm.ibm_zos_core.zos_data_set:
+        name: "{{ new_shrnkwrp_dsn }}"
+        state: absent
+      environment: "{{ environment_vars }}"
+      ignore_errors: true  # not an error if DSN does not exist
+      when: not (typrun_norun | default(true) | bool)
+      register: _scratch_result
+
+    - name: Show scratch result
+      debug:
+        msg: >-
+          Scratch {{ new_shrnkwrp_dsn }}:
+          {{ 'deleted' if (_scratch_result.changed | default(false)) else 'not found (no action needed)' }}
+      when: not (typrun_norun | default(true) | bool)
+
+    # ── 5. Generate and submit JCL ─────────────────────────────────────────
+    - name: Render SHRNKWRP JCL from template
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/shrinkwrap.j2"
+        dest: "/tmp/shrnkwrp_{{ inventory_hostname }}.jcl"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+
+    - name: Copy SHRNKWRP JCL to z/OS USS
+      ibm.ibm_zos_core.zos_copy:
+        src: "/tmp/shrnkwrp_{{ inventory_hostname }}.jcl"
+        dest: "/tmp/shrnkwrp_{{ inventory_hostname }}.jcl"
+        replace: true
+        binary: false
+        encoding:
+          from: UTF-8
+          to: IBM-1047
+      environment: "{{ environment_vars }}"
+
+    - name: Submit SHRNKWRP job
+      ibm.ibm_zos_core.zos_job_submit:
+        src: "/tmp/shrnkwrp_{{ inventory_hostname }}.jcl"
+        location: uss
+        wait_time: 7200
+      environment: "{{ environment_vars }}"
+      register: _shrnkwrp_submit
+      failed_when: false
+
+    - name: Fail if SHRNKWRP job could not be submitted
+      fail:
+        msg: >-
+          SHRNKWRP submission failed — no job_id returned.
+          Error: {{ _shrnkwrp_submit.msg | default('unknown') }}
+      when: >-
+        _shrnkwrp_submit.jobs is not defined
+        or _shrnkwrp_submit.jobs | length == 0
+        or _shrnkwrp_submit.jobs[0].job_id is not defined
+
+    # ── 6. Monitor job ─────────────────────────────────────────────────────
+    - name: Poll SHRNKWRP job until complete
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _shrnkwrp_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _shrnkwrp_poll
+      failed_when: false
+      until: >
+        _shrnkwrp_poll.jobs is defined
+        and _shrnkwrp_poll.jobs | length > 0
+        and ((_shrnkwrp_poll.jobs[0].ret_code.code | default(none) is not none
+              and _shrnkwrp_poll.jobs[0].ret_code.code | string | lower not in ['none', 'null', ''])
+             or _shrnkwrp_poll.jobs[0].status | default('ACTIVE') | upper not in ['AC', 'ACTIVE', 'INPUT', 'HELD'])
+      retries: 720
+      delay: 10
+
+    - name: Re-verify SHRNKWRP job is not active
+      ibm.ibm_zos_core.zos_job_query:
+        job_id: "{{ _shrnkwrp_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: _shrnkwrp_reverify
+
+    - name: Fail if SHRNKWRP job still active after poll
+      fail:
+        msg: >-
+          SHRNKWRP job {{ _shrnkwrp_submit.jobs[0].job_id }} is still active.
+          Poll false-positive — increase delay or re-run.
+      when: >-
+        _shrnkwrp_reverify.jobs is defined
+        and _shrnkwrp_reverify.jobs | length > 0
+        and _shrnkwrp_reverify.jobs[0].status | default('') | upper in ['AC', 'ACTIVE', 'INPUT', 'HELD']
+
+    - name: Capture SHRNKWRP RC
+      set_fact:
+        shrnkwrp_rc: >-
+          {{ _shrnkwrp_poll.jobs[0].ret_code.code | int
+             if (_shrnkwrp_poll.jobs[0].ret_code is defined
+                 and _shrnkwrp_poll.jobs[0].ret_code.code is not none
+                 and _shrnkwrp_poll.jobs[0].ret_code.code | string != 'None')
+             else ((_shrnkwrp_poll.jobs[0].ret_code.msg | default('CC 0000'))
+                   | regex_replace('^CC\s+0*(\d+).*', '\1') | default('0')) | int }}
+
+    # ── 7. Retrieve output ─────────────────────────────────────────────────
+    - name: Fetch SHRNKWRP full output
+      ibm.ibm_zos_core.zos_job_output:
+        job_id: "{{ _shrnkwrp_submit.jobs[0].job_id }}"
+      environment: "{{ environment_vars }}"
+      register: shrnkwrp_job
+
+    - name: Display SHRNKWRP result
+      debug:
+        msg: >-
+          Job {{ shrnkwrp_job.jobs[0].job_name }}
+          ({{ shrnkwrp_job.jobs[0].job_id }})
+          RC={{ shrnkwrp_rc }}
+
+    - name: Fail if SHRNKWRP RC > 4
+      fail:
+        msg: >-
+          SHRNKWRP FAILED — RC={{ shrnkwrp_rc }}.
+          Review SYSPRINT for job {{ shrnkwrp_job.jobs[0].job_id }}.
+          Common causes: ADR006E (space), ADR014E (DSN exists), ADR052E (no datasets matched).
+      when: shrnkwrp_rc | int > 4
+
+    - name: Extract and display ADR messages from SYSPRINT
+      set_fact:
+        _shrnkwrp_sysprint: "{{ shrnkwrp_job.jobs[0].ddnames
+          | selectattr('ddname', 'equalto', 'SYSPRINT')
+          | map(attribute='content')
+          | list | first | default('') }}"
+      when: shrnkwrp_job.jobs[0].ddnames is defined
+
+    - name: Display ADR dataset counts and key messages
+      debug:
+        msg: "{{ ((_shrnkwrp_sysprint is string) | ternary(_shrnkwrp_sysprint, _shrnkwrp_sysprint | join('\n'))) | regex_findall('ADR[0-9]+[A-Z]\\s.+') }}"
+      when: _shrnkwrp_sysprint is defined and _shrnkwrp_sysprint | length > 0
+
+    # ── 8. Audit log ───────────────────────────────────────────────────────
+    - name: Save SHRNKWRP audit log
+      copy:
+        content: "{{ shrnkwrp_job | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../logs/shrnkwrp_{{ _new_qual_rest | replace('.', '_') }}_{{ now(fmt='%Y%m%d_%H%M%S') }}.json"
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_shell_executable: /bin/bash
+      ignore_errors: true
+
+    # ── 9. Completion summary ──────────────────────────────────────────────
+    - name: Display completion summary
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           SHRNKWRP COMPLETE
+          ══════════════════════════════════════════════════════
+           Job        : {{ shrnkwrp_job.jobs[0].job_name }} ({{ shrnkwrp_job.jobs[0].job_id }})
+           RC         : {{ shrnkwrp_rc }}
+           Mode       : {{ 'DRY RUN (TYPRUN=NORUN)' if (typrun_norun | bool) else 'LIVE RUN' }}
+           New qual   : {{ new_qual }}
+           Output DSN : {{ new_shrnkwrp_dsn }}
+          ══════════════════════════════════════════════════════
+          {% if typrun_norun | bool %}
+           NOTE: This was a dry run. The output dataset was NOT created.
+                 Review the SYSPRINT dataset list and re-run with
+                 -e "typrun_norun=false" to create the shrinkwrap.
+          {% endif %}

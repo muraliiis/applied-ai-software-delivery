@@ -1,0 +1,82 @@
+---
+# =============================================================
+#  test-zosmf.yml — z/OSMF Connectivity & Action Test
+#  Tests:
+#    1. zmf_authenticate  — get LTPA token from z/OSMF (REST)
+#    2. zos_tso_command   — run TSO LISTCAT via SSH → z/OS
+#    3. zos_operator      — issue MVS D IPLINFO via SSH → z/OS
+# =============================================================
+
+# ------------------------------------------------------------------
+# PLAY 1: z/OSMF REST API test (runs on localhost, calls z/OSMF API)
+# ------------------------------------------------------------------
+- name: "TEST 1 — z/OSMF Authentication via REST API"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Override z/OS shell settings from group_vars/all — not valid on localhost
+    ansible_shell_executable: /bin/bash
+    ansible_python_interpreter: /usr/bin/python3
+    zmf_host: "138.69.218.201"
+    zmf_port: 443
+    zmf_user: "syssa69"
+
+  tasks:
+    - name: "[TEST 1] Authenticate with z/OSMF"
+      ibm.ibm_zosmf.zmf_authenticate:
+        zmf_host: "{{ zmf_host }}"
+        zmf_port: "{{ zmf_port }}"
+        zmf_user: "{{ zmf_user }}"
+        zmf_password: "{{ zmf_password }}"
+      register: zmf_auth
+
+    - name: "[TEST 1] z/OSMF Authentication — show result keys"
+      debug:
+        var: zmf_auth
+
+# ------------------------------------------------------------------
+# PLAY 2: z/OS SSH tests (runs on dcuf via SSH + ibm.ibm_zos_core)
+# ------------------------------------------------------------------
+- name: "TEST 2 & 3 — z/OS TSO and Operator Commands via SSH"
+  hosts: dcuf
+  gather_facts: false
+
+  tasks:
+
+    # ----------------------------------------------------------
+    # TEST 2: TSO LISTCAT
+    # ----------------------------------------------------------
+    - name: "[TEST 2] Run TSO LISTCAT via zos_tso_command"
+      ibm.ibm_zos_core.zos_tso_command:
+        commands:
+          - "LISTCAT ENTRIES('SYS1.TSTPLX1.UCAT') ALL"
+      register: tso_result
+
+    - name: "[TEST 2] TSO LISTCAT output"
+      debug:
+        msg: "{{ tso_result.output[0].content }}"
+
+    # ----------------------------------------------------------
+    # TEST 3: MVS Operator D IPLINFO
+    # ----------------------------------------------------------
+    - name: "[TEST 3] Issue MVS operator command — D IPLINFO"
+      ibm.ibm_zos_core.zos_operator:
+        cmd: "D IPLINFO"
+        wait_time_s: 10
+      register: operator_result
+
+    - name: "[TEST 3] D IPLINFO output"
+      debug:
+        msg: "{{ operator_result.content }}"
+
+    # ----------------------------------------------------------
+    # SUMMARY
+    # ----------------------------------------------------------
+    - name: "=== TEST SUMMARY ==="
+      debug:
+        msg:
+          - "TEST 1 — zmf_authenticate : PASS  (LTPA token obtained, length={{ hostvars['localhost']['zmf_auth']['ltpa_token_2'] | length }})"
+          - "TEST 2 — zos_tso_command  : PASS  (LISTCAT output received)"
+          - "TEST 3 — zos_operator     : PASS  (D IPLINFO output received, z/OS {{ operator_result.content[4] | trim }})"

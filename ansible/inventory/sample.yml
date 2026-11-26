@@ -1,0 +1,35 @@
+# Sample Ansible Inventory for z/OS LPARs
+
+[all:vars]
+ansible_python_interpreter=/usr/lpp/IBM/cyp/v3r8/pyz/bin/python3
+
+[production]
+prod1 ansible_host=138.69.218.201 ansible_user=syssa69
+prod2 ansible_host=138.69.218.201 ansible_user=syssa69
+
+[staging]
+stage1 ansible_host=138.69.218.201 ansible_user=syssa69
+
+[development]
+dev1 ansible_host=138.69.218.201 ansible_user=syssa69
+dev2 ansible_host=138.69.218.201 ansible_user=syssa69
+
+[lpars:children]
+production
+staging
+development
+
+[lpars:vars]
+# SMP/E Configuration
+smpe_csi_hlq=SMPE
+smpe_global_zone=GLOBAL
+smpe_target_zone=MVST100
+smpe_dlib_zone=MVST100D
+
+# Common paths
+package_staging_dir=/u/staging/packages
+backup_dir=/u/backups
+
+# Timeouts
+job_wait_timeout=3600
+transfer_timeout=1800

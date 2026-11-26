@@ -1,0 +1,39 @@
+//COPYRENA JOB ({{ smpe_job_acct | default('') }}),'SDT',CLASS={{ smpe_job_class | default('S') }},NOTIFY=&SYSUID,
+//        MSGCLASS={{ smpe_job_msgclass | default('X') }},REGION=0M
+//*
+//* ADRDSSU Cleanup and Restore — generated {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host      : {{ inventory_hostname }}
+//* Old qual  : {{ cleanup_include_old }}
+//* New qual  : {{ cleanup_include_new }}
+//* Shrinkwrp : {{ tape2_dsn }}
+//*
+//CLEANUP  EXEC PGM=ADRDSSU{{ ",PARM='TYPRUN=NORUN'" if (typrun_norun | default(true) | bool) else '' }}
+//SYSPRINT DD  SYSOUT=*
+//TAPE1    DD  DUMMY
+//SYSIN    DD  *
+ DUMP OUTDDNAME(TAPE1)                              -
+ DATASET(EXCLUDE(                                   -
+                 {{ cleanup_exclude }}              -
+                 )                                  -
+         INCLUDE(                                   -
+                 {{ cleanup_include_old }}          -
+                 {{ cleanup_include_new }}          -
+                ))                                  -
+       SPHERE DELETE PURGE
+/*
+//RESTDSN  EXEC PGM=ADRDSSU{{ ",PARM='TYPRUN=NORUN'" if (typrun_norun | default(true) | bool) else '' }}
+//TAPE2    DD DISP=(OLD,PASS),
+//         DSN={{ tape2_dsn }}
+//SYSPRINT DD SYSOUT=*
+//SYSIN    DD *
+ RESTORE INDDNAME(TAPE2)                            -
+   DS(INCLUDE(                                      -
+    {{ restore_include }}                           -
+                   ))                              -
+   RENAMEU(                                        -
+   ({{ rename_acsns_old }}                         -
+    {{ rename_acsns_new }})                        -
+   ({{ rename_acsvs_old }}                         -
+    {{ rename_acsvs_new }})                        -
+          )CATALOG
+/*

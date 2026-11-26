@@ -1,0 +1,53 @@
+//IBMRCV   JOB  ({{ smpe_job_acct | default('') }}),'RECEIVE ORDER',
+//             CLASS={{ smpe_job_class | default('A') }},
+//             MSGCLASS={{ smpe_job_msgclass | default('X') }},
+//             NOTIFY=&SYSUID,MSGLEVEL=(1,1)
+//*
+//* JOB  : ACSNS.IBM.SAMPLE.JCLS(RSUORDER)
+//* DESC : SMP/E RECEIVE ORDER - IBM internet delivery via GIMSMP/HTTPS
+//* DATE : {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* HOST : {{ inventory_hostname }}
+//* CSI  : {{ smpe_csi_dsn }}
+//* NTS  : {{ smpe_nts_path }}  (staging directory, not a credentials file)
+//* ZONE : {{ smpe_global_zone }}
+//*
+//SMPER1  EXEC PGM=GIMSMP,REGION=0M,
+//             PARM='PROCESS=WAIT'
+//SMPCSI   DD  DISP=SHR,DSN={{ smpe_csi_dsn }}
+//SMPNTS   DD  PATHDISP=KEEP,
+//             PATH='{{ smpe_nts_path }}'
+//SMPOUT   DD  SYSOUT=*
+//SMPRPT   DD  SYSOUT=*
+//SMPLIST  DD  SYSOUT=*
+//SMPLOG   DD  SYSOUT=*
+//SYSPRINT DD  SYSOUT=*
+//SMPJHOME DD  PATHDISP=KEEP,
+//             PATH='{{ smpe_javahome }}'
+//SYSUT1   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SYSUT2   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SYSUT3   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SYSUT4   DD  UNIT=SYSALLDA,SPACE=(CYL,(100,200))
+//SMPCNTL  DD  *
+  SET BDY({{ smpe_global_zone }}).
+  RECEIVE ORDER(ORDERSERVER(ORDSRVR)
+          CLIENT(MYCLIENT)
+          CONTENT(ALL))
+          DELETEPKG.
+/*
+//ORDSRVR  DD  *
+  <ORDERSERVER
+  url="{{ smpe_orderserver_url }}"
+  keyring="{{ smpe_secint_keyring }}"
+  certificate="HTTPS SMPE SECINT Certificate">
+  </ORDERSERVER>
+/*
+//MYCLIENT DD  *
+  <CLIENT
+  signaturekeyring="{{ smpe_client_keyring }}"
+  downloadmethod="https"
+  javahome="{{ smpe_javahome }}"
+  classpath="{{ smpe_classpath }}"
+  javadebugoptions="-Dcom.ibm.smp.debug=severe -showversion"
+  downloadkeyring="javatruststore">
+  </CLIENT>
+/*

@@ -1,0 +1,24 @@
+//{{ _vendor_jobpfx }}{{ 'APK' if (apply_check_mode | default(true)) else 'APL' }}   JOB ({{ smpe_job_acct | default('') }}),'{{ 'SMP/E APPLY CHECK' if (apply_check_mode | default(true)) else 'SMP/E APPLY' }}',
+//         CLASS={{ smpe_job_class | default('A') }},
+//         MSGCLASS={{ smpe_job_msgclass | default('X') }},
+//         NOTIFY=&SYSUID,MSGLEVEL=(1,1)
+//*-----------------------------------------------------------------
+//* SMP/E {{ 'APPLY CHECK  -  dry-run before production APPLY' if (apply_check_mode | default(true)) else 'APPLY  -  install SYSMODs into TARGET zone' }}
+//* Generated  : {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host       : {{ inventory_hostname }}
+//* SMPCSI     : {{ smpe_csi_dsn | default(smpe_global_csi) }}
+//* Target zone: {{ smpe_target_zone }}
+//*-----------------------------------------------------------------
+//STEP001  EXEC PGM=GIMSMP,REGION=0M,PARM='PROCESS=WAIT'
+//SMPCSI   DD DISP=SHR,DSN={{ smpe_csi_dsn | default(smpe_global_csi) }}
+//SMPJHOME DD PATHDISP=KEEP,
+//            PATH='{{ smpe_javahome }}'
+//SMPOUT   DD SYSOUT=*
+//SMPRPT   DD SYSOUT=*
+//SMPLIST  DD SYSOUT=*
+//SMPLOG   DD SYSOUT=*
+//SYSPRINT DD SYSOUT=*
+//SMPCNTL  DD *
+  SET BDY({{ smpe_target_zone }}) .
+  APPLY{{ ' CHECK' if (apply_check_mode | default(true)) else '' }} BYPASS(HOLDSYS) GEXT.
+/*

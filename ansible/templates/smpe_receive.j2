@@ -1,0 +1,30 @@
+//RSUORDER JOB ({{ smpe_job_acct | default('') }}),'SMP/E RECEIVE ORDER',
+//         CLASS={{ smpe_job_class | default('A') }},
+//         MSGCLASS={{ smpe_job_msgclass | default('X') }},
+//         NOTIFY=&SYSUID,MSGLEVEL=(1,1)
+//*-----------------------------------------------------------------
+//* Based on : ACSNS.IBM.SAMPLE.JCLS(RSUORDER)
+//* Purpose  : SMP/E RECEIVE ORDER - Internet delivery via GIMZIP
+//* Generated: {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+//* Host     : {{ inventory_hostname }}
+//* SMPCSI   : {{ smpe_csi_dsn }}
+//* SMPNTS   : {{ smpe_nts_dsn }}
+//* SYSMODs  : {{ smpe_sysmods | join(' ') }}
+//*-----------------------------------------------------------------
+//RSUORDER EXEC PGM=GIMZIP,REGION=0M,
+//         PARM='FILETAG'
+//STEPLIB  DD DSN=SYS1.MIGLIB,DISP=SHR
+//SMPNTS   DD DSN={{ smpe_nts_dsn }},DISP=SHR
+//SMPCSI   DD DSN={{ smpe_csi_dsn }},DISP=SHR
+//SYSPRINT DD SYSOUT=*
+//SYSABEND DD SYSOUT=*
+//SMPCNTL  DD *
+  SET BDY({{ smpe_global_zone }}).
+  RECEIVE ORDER
+    SYSMODS(
+{% for sysmod in smpe_sysmods %}
+      {{ sysmod }}
+{% endfor %}
+    )
+    .
+/*

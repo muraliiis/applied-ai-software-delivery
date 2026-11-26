@@ -1,0 +1,49 @@
+{
+  "system": "DCUF",
+  "lpar": "dcuf.atos-nao.net",
+  "audits": [
+    {
+      "audit_id": "DCUF-20260526-001",
+      "date": "2026-05-26",
+      "timestamp": "2026-05-26T12:00:08Z",
+      "executed_by": "SYSSA69",
+      "zos_version": "05.29.00",
+      "zos_release": "3.1",
+      "collection_source": "HZSPROC",
+      "total_registered": 185,
+      "not_applicable": 35,
+      "total_evaluated": 150,
+      "pass": 105,
+      "warning": 17,
+      "exception_high": 4,
+      "exception_low": 20,
+      "error": 2,
+      "skipped": 2,
+      "overall_compliance_pct": 70,
+      "top_risk_score": 10,
+      "new_exceptions": 43,
+      "resolved_since_last": 0,
+      "category_scores": {
+        "SECURITY": 67,
+        "STORAGE": 100,
+        "PERFORMANCE": 92,
+        "AVAILABILITY": 84,
+        "IO_SUBSYSTEM": 85,
+        "UNIX_SERVICES": 93,
+        "NETWORK": 94,
+        "JES_SPOOL": 82,
+        "MIGRATION": 67,
+        "SYSTEM_BASE": 69,
+        "SUBSYSTEMS": 44
+      },
+      "top_risks": [
+        {"check": "RACF_SENSITIVE_RESOURCES", "owner": "IBMRACF", "category": "SECURITY", "score": 10},
+        {"check": "XCF_CDS_SPOF", "owner": "IBMXCF", "category": "AVAILABILITY", "score": 10},
+        {"check": "JES2_CKPT_CONFIG_ADAJES0F", "owner": "IBMJES2", "category": "JES_SPOOL", "score": 10},
+        {"check": "USS_PARMLIB_MOUNTS", "owner": "IBMUSS", "category": "UNIX_SERVICES", "score": 10},
+        {"check": "RACF_ENCRYPTION_ALGORITHM", "owner": "IBMRACF", "category": "SECURITY", "score": 9}
+      ],
+      "report_path": "docs/audit-reports/audit-DCUF-20260526.md"
+    }
+  ]
+}

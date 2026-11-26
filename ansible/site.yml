@@ -1,0 +1,20 @@
+---
+# site.yml — Pipeline entry point for z/OS deployments.
+#
+# Run this instead of individual playbooks to ensure correct execution order.
+# setup-zos-env runs first on every execution, guaranteeing /tmp/zos_shell.sh
+# exists on all managed nodes before any ibm_zos_core module is invoked.
+#
+# Usage:
+#   ansible-playbook site.yml -i inventory/hosts.yml --ask-pass
+#   ansible-playbook site.yml -i inventory/hosts.yml --ask-pass -l dev1
+#   ansible-playbook site.yml -i inventory/hosts.yml --ask-pass -e "target=stage1"
+
+# ── Step 1: Bootstrap ──────────────────────────────────────────────────────
+# Creates /tmp/zos_shell.sh on each managed node using /bin/sh directly.
+# Must run first — all subsequent plays depend on the wrapper.
+- import_playbook: playbooks/setup-zos-env.yml
+
+# ── Step 2: Connectivity check ────────────────────────────────────────────
+# Verifies ibm_zos_core can reach the managed node and execute REXX modules.
+- import_playbook: playbooks/zos-ping.yml
