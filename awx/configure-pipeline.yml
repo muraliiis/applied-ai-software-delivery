@@ -1,0 +1,291 @@
+---
+# Playbook : awx/configure-pipeline.yml
+# Purpose  : Declaratively creates all AWX objects needed for the ISV Maintenance
+#            Pipeline Workflow in Automation Controller / AWX.
+#
+# Prerequisites:
+#   pip install ansible-navigator awxkit
+#   ansible-galaxy collection install ansible.controller
+#
+# Usage:
+#   ansible-playbook awx/configure-pipeline.yml \
+#     -e "controller_host=https://awx.example.com" \
+#     -e "controller_username=admin" \
+#     -e "controller_password=vault_secret" \
+#     -e "scm_url=https://github.gsissc.myatos.net/US-IRV-MAINFRAME-SERVICES/applied-ai-software-delivery" \
+#     -e "scm_credential=github-pat"
+#
+# Or set environment variables:
+#   export CONTROLLER_HOST=https://awx.example.com
+#   export CONTROLLER_USERNAME=admin
+#   export CONTROLLER_PASSWORD=...
+#
+# Objects created:
+#   Organisation  : SDT
+#   Project       : ISV Maintenance Pipeline (Git SCM)
+#   Inventory     : DCUF LPAR
+#   Credentials   : DCUF SSH, DCUF Vault
+#   Job Templates : copyrena-restore, ddefupdt, internet-maintenance,
+#                   apply-check, shrinkwrap
+#   Workflow      : ISV Maintenance Pipeline (with approval nodes)
+
+- name: Configure ISV Maintenance Pipeline in AWX
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  collections:
+    - ansible.controller
+
+  vars:
+    # ── Controller connection — override via -e or environment variables ──
+    controller_host:      "{{ lookup('env', 'CONTROLLER_HOST') | default('https://awx.example.com') }}"
+    controller_username:  "{{ lookup('env', 'CONTROLLER_USERNAME') | default('admin') }}"
+    controller_password:  "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
+    controller_validate_certs: true
+
+    # ── Source control ─────────────────────────────────────────────────────
+    scm_url:        "https://github.gsissc.myatos.net/US-IRV-MAINFRAME-SERVICES/applied-ai-software-delivery"
+    scm_branch:     "main"
+    scm_credential: "github-pat"           # AWX credential name for Git access
+
+    # ── Object names ───────────────────────────────────────────────────────
+    org_name:         "SDT"
+    project_name:     "ISV Maintenance Pipeline"
+    inventory_name:   "DCUF LPAR"
+    ssh_cred_name:    "DCUF SSH"
+    vault_cred_name:  "DCUF Vault"
+
+  tasks:
+    # ── Organisation ──────────────────────────────────────────────────────
+    - name: Ensure SDT organisation exists
+      ansible.controller.organization:
+        name: "{{ org_name }}"
+        description: "Software Delivery Team"
+        state: present
+
+    # ── Project ───────────────────────────────────────────────────────────
+    - name: Create / update SCM project
+      ansible.controller.project:
+        name: "{{ project_name }}"
+        organization: "{{ org_name }}"
+        scm_type: git
+        scm_url: "{{ scm_url }}"
+        scm_branch: "{{ scm_branch }}"
+        scm_credential: "{{ scm_credential }}"
+        scm_update_on_launch: true
+        scm_clean: false
+        scm_delete_on_update: false
+        state: present
+
+    # ── Inventory ─────────────────────────────────────────────────────────
+    - name: Create / update DCUF inventory
+      ansible.controller.inventory:
+        name: "{{ inventory_name }}"
+        organization: "{{ org_name }}"
+        description: "DCUF z/OS LPAR at 138.69.218.201"
+        state: present
+
+    # ── Job Templates ─────────────────────────────────────────────────────
+    - name: "Job Template: COPYRENA Restore"
+      ansible.controller.job_template:
+        name: "ISV - COPYRENA Restore"
+        organization: "{{ org_name }}"
+        project: "{{ project_name }}"
+        playbook: "ansible/playbooks/copyrena-restore.yml"
+        inventory: "{{ inventory_name }}"
+        credentials:
+          - "{{ ssh_cred_name }}"
+          - "{{ vault_cred_name }}"
+        ask_variables_on_launch: false
+        extra_vars:
+          # Passed from Workflow Survey — no hardcoded defaults here
+          typrun_norun: "true"
+        state: present
+
+    - name: "Job Template: DDDEF Update"
+      ansible.controller.job_template:
+        name: "ISV - DDDEF Update"
+        organization: "{{ org_name }}"
+        project: "{{ project_name }}"
+        playbook: "ansible/playbooks/ddefupdt.yml"
+        inventory: "{{ inventory_name }}"
+        credentials:
+          - "{{ ssh_cred_name }}"
+          - "{{ vault_cred_name }}"
+        ask_variables_on_launch: false
+        state: present
+
+    - name: "Job Template: Internet Maintenance (RECEIVE → APPLY)"
+      ansible.controller.job_template:
+        name: "ISV - Internet Maintenance"
+        organization: "{{ org_name }}"
+        project: "{{ project_name }}"
+        playbook: "ansible/playbooks/internet-maintenance.yml"
+        inventory: "{{ inventory_name }}"
+        credentials:
+          - "{{ ssh_cred_name }}"
+          - "{{ vault_cred_name }}"
+        ask_variables_on_launch: false
+        state: present
+
+    - name: "Job Template: Shrinkwrap"
+      ansible.controller.job_template:
+        name: "ISV - Shrinkwrap"
+        organization: "{{ org_name }}"
+        project: "{{ project_name }}"
+        playbook: "ansible/playbooks/shrinkwrap.yml"
+        inventory: "{{ inventory_name }}"
+        credentials:
+          - "{{ ssh_cred_name }}"
+          - "{{ vault_cred_name }}"
+        ask_variables_on_launch: false
+        extra_vars:
+          typrun_norun: "true"
+        state: present
+
+    # ── Workflow Job Template ─────────────────────────────────────────────
+    - name: "Create ISV Maintenance Pipeline Workflow"
+      ansible.controller.workflow_job_template:
+        name: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        description: >
+          End-to-end ISV maintenance pipeline for IBM, Broadcom, and BMC products
+          on z/OS. Runs: COPYRENA → DDEFUPDT → RECEIVE → APPLY CHECK → [Approval]
+          → APPLY → ACCEPT CHECK → [Approval] → ACCEPT → Shrinkwrap.
+        inventory: "{{ inventory_name }}"
+        extra_vars:
+          ansible_connection: smart
+        survey_enabled: true
+        survey_spec: "{{ lookup('file', 'pipeline-survey.json') | from_json }}"
+        ask_variables_on_launch: false
+        state: present
+
+    # ── Workflow Nodes ─────────────────────────────────────────────────────
+    # Node 1 — COPYRENA Restore
+    - name: "Workflow node: COPYRENA Restore"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-copyrena"
+        unified_job_template: "ISV - COPYRENA Restore"
+        state: present
+
+    # Node 2 — DDDEF Update (runs after COPYRENA succeeds)
+    - name: "Workflow node: DDDEF Update"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-ddefupdt"
+        unified_job_template: "ISV - DDDEF Update"
+        state: present
+
+    - name: "Link: COPYRENA → DDDEF Update (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-copyrena"
+        success_nodes:
+          - "node-ddefupdt"
+        state: present
+
+    # Node 3 — Internet Maintenance / RECEIVE ORDER
+    - name: "Workflow node: Internet Maintenance"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-internet-maint"
+        unified_job_template: "ISV - Internet Maintenance"
+        state: present
+
+    - name: "Link: DDDEF Update → Internet Maintenance (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-ddefupdt"
+        success_nodes:
+          - "node-internet-maint"
+        state: present
+
+    # Node 4 — Approval: APPLY CHECK Review
+    - name: "Workflow approval node: APPLY CHECK Review"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "approval-apply"
+        approval_node:
+          name: "APPLY CHECK Review"
+          description: >
+            Review the APPLY CHECK output from the Internet Maintenance job.
+            Check the SYSMOD list, HOLDDATA status, and RC before approving.
+            Approve to proceed with APPLY; deny to abort the pipeline.
+          timeout: 86400   # 24-hour approval window
+        state: present
+
+    - name: "Link: Internet Maintenance → APPLY CHECK Approval (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-internet-maint"
+        success_nodes:
+          - "approval-apply"
+        state: present
+
+    # Node 5 — Shrinkwrap (runs after ACCEPT approval)
+    - name: "Workflow node: Shrinkwrap"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "node-shrinkwrap"
+        unified_job_template: "ISV - Shrinkwrap"
+        state: present
+
+    # Node 6 — Approval: ACCEPT CHECK Review
+    - name: "Workflow approval node: ACCEPT CHECK Review"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "approval-accept"
+        approval_node:
+          name: "ACCEPT CHECK Review"
+          description: >
+            Review the ACCEPT CHECK output. Confirm SYSMODs to be accepted into
+            DLIB zone before proceeding. Approve to run ACCEPT; deny to stop
+            pipeline after APPLY (SYSMODs remain in TARGET zone only).
+          timeout: 86400
+        state: present
+
+    - name: "Link: APPLY Approval → ACCEPT CHECK Approval (on approval)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "approval-apply"
+        success_nodes:
+          - "approval-accept"
+        state: present
+
+    - name: "Link: ACCEPT Approval → Shrinkwrap (on approval)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "ISV Maintenance Pipeline"
+        organization: "{{ org_name }}"
+        identifier: "approval-accept"
+        success_nodes:
+          - "node-shrinkwrap"
+        state: present
+
+    # ── Final report ───────────────────────────────────────────────────────
+    - name: Pipeline configuration complete
+      debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+           AWX Pipeline Configuration Complete
+          ══════════════════════════════════════════════════════
+           Organisation : {{ org_name }}
+           Project      : {{ project_name }}
+           Workflow     : ISV Maintenance Pipeline
+           Nodes        : COPYRENA → DDEFUPDT → Internet Maintenance
+                          → [APPLY Approval] → [ACCEPT Approval] → Shrinkwrap
+           Survey       : 14 questions loaded
+          ══════════════════════════════════════════════════════
+           To launch: Log in to AWX, find 'ISV Maintenance Pipeline'
+           under Templates, fill in the survey, and click Launch.
